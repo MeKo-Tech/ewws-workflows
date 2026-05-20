@@ -9,11 +9,19 @@ on:
   workflow_call:
     inputs:
       release-type:
-        description: "release-please release-type. `simple` for repos with a `version.txt`; `go` for Go modules; `node`, etc."
+        description: "release-please release-type. `simple` for repos with a `version.txt`; `go` for Go modules; `node`, etc. Ignored when `config-file` is set."
         type: string
         default: simple
       package-name:
         description: "Used in the release-please-action `package-name` field. Defaults to the repo name."
+        type: string
+        default: ""
+      config-file:
+        description: "Path to release-please-config.json. Set this for multi-package monorepos; mutually exclusive with `release-type`."
+        type: string
+        default: ""
+      manifest-file:
+        description: "Path to .release-please-manifest.json. Required when `config-file` is set."
         type: string
         default: ""
     outputs:
@@ -36,9 +44,15 @@ jobs:
       tag-name: ${{ steps.rp.outputs.tag_name }}
     steps:
       # googleapis/release-please-action@v4.3.0 — pin by SHA per repo policy.
+      #
+      # The action accepts EITHER release-type (simple repos with one
+      # package) OR config-file/manifest-file (multi-package layout).
+      # When `config-file` is set the action ignores release-type.
       - id: rp
         uses: googleapis/release-please-action@a02a34c4d625f9be7cb89156071d8567266a2445
         with:
           release-type: ${{ inputs.release-type }}
           package-name: ${{ inputs.package-name || github.event.repository.name }}
+          config-file: ${{ inputs.config-file }}
+          manifest-file: ${{ inputs.manifest-file }}
           token: ${{ secrets.GITHUB_TOKEN }}
