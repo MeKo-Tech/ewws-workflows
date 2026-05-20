@@ -11,9 +11,20 @@ on:
   workflow_call:
     inputs:
       types:
-        description: "Allowed type prefixes (comma-separated). Default mirrors the conventional-commit spec + release-please's recognised set."
+        description: "Allowed type prefixes — newline-separated, one per line. Default mirrors the conventional-commit spec + release-please's recognised set."
         type: string
-        default: "feat,fix,chore,docs,refactor,perf,test,build,ci,style,revert"
+        default: |
+          feat
+          fix
+          chore
+          docs
+          refactor
+          perf
+          test
+          build
+          ci
+          style
+          revert
 
 permissions:
   pull-requests: read
@@ -23,6 +34,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       # amannn/action-semantic-pull-request@v5.5.3 — pin by SHA per repo policy.
+      # `types:` MUST be newline-separated; a comma-separated string is
+      # consumed as ONE literal type and rejects every real PR title.
       - uses: amannn/action-semantic-pull-request@0723387faaf9b38adef4775cd42cfd5155ed6017
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
