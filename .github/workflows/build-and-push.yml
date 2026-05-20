@@ -1,0 +1,79 @@
+name: build-and-push
+
+# Multi-arch (amd64 + arm64) Docker build, pushed to ghcr.io. Tags follow
+# the metadata-action convention so chungus image-updater + the
+# platform-UI drift detector can both parse them:
+#
+#   type=ref,event=branch      → e.g. "main" or "deploy/foo"
+#   type=ref,event=pr          → "pr-123"
+#   type=semver,pattern={...}  → "1.2.3" + "1.2" + "1"
+#   type=sha,prefix=sha-       → "sha-c69034c" (git short SHA)
+#
+# The `sha-*` tag is the one platform-UI's drift detector strips the
+# prefix from to feed into the GitHub compare API.
+
+on:
+  workflow_call:
+    inputs:
+      image-name:
+        description: "Full OCI image name without tag. Conventional value: `ghcr.io/meko-tech/<repo>`."
+        type: string
+        required: true
+      dockerfile:
+        description: "Path to the Dockerfile relative to repo root."
+        type: string
+        default: ./Dockerfile
+      context:
+        description: "Build context dir."
+        type: string
+        default: .
+      platforms:
+        description: "Comma-separated platforms for buildx. Default amd64 + arm64."
+        type: string
+        default: linux/amd64,linux/arm64
+      push:
+        description: "Whether to push the image (skip for PR previews)."
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      # actions/checkout@v4.2.2
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      # docker/setup-qemu-action@v3.4.0
+      - uses: docker/setup-qemu-action@29109295f81e9208d7d86ff1c6c12d2833863392
+      # docker/setup-buildx-action@v3.10.0
+      - uses: docker/setup-buildx-action@b5ca514318bd6ebac0fb2aedd5d36ec1b5c232a2
+      # docker/login-action@v3.5.0 — `secrets: inherit` from caller gives us GITHUB_TOKEN.
+      - uses: docker/login-action@184bdaa0721073962dff0199f1fb9940f07167d1
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      # docker/metadata-action@v5.7.0
+      - id: meta
+        uses: docker/metadata-action@902fa8ec7d6ecbf8d84d538b9b233a880e428804
+        with:
+          images: ${{ inputs.image-name }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            type=sha,prefix=sha-
+      # docker/build-push-action@v6.21.0
+      - uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c1c
+        with:
+          context: ${{ inputs.context }}
+          file: ${{ inputs.dockerfile }}
+          platforms: ${{ inputs.platforms }}
+          push: ${{ inputs.push && github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}

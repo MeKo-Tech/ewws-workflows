@@ -1,0 +1,44 @@
+name: release-please
+
+# Cuts release PRs + tags from Conventional Commits. Default `release-type:
+# simple` reads version from `version.txt`. The `released` and `tag-name`
+# outputs let downstream jobs (build-and-push, sbom-upload, etc.) gate on
+# whether this run actually produced a release.
+
+on:
+  workflow_call:
+    inputs:
+      release-type:
+        description: "release-please release-type. `simple` for repos with a `version.txt`; `go` for Go modules; `node`, etc."
+        type: string
+        default: simple
+      package-name:
+        description: "Used in the release-please-action `package-name` field. Defaults to the repo name."
+        type: string
+        default: ""
+    outputs:
+      released:
+        description: "true when this run cut a new tag"
+        value: ${{ jobs.release.outputs.released }}
+      tag-name:
+        description: "The cut tag (e.g. `v1.2.3`). Empty when `released=false`."
+        value: ${{ jobs.release.outputs.tag-name }}
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    outputs:
+      released: ${{ steps.rp.outputs.release_created }}
+      tag-name: ${{ steps.rp.outputs.tag_name }}
+    steps:
+      # googleapis/release-please-action@v4.3.0 — pin by SHA per repo policy.
+      - id: rp
+        uses: googleapis/release-please-action@a02a34c4d625f9be7cb89156071d8567266a2445
+        with:
+          release-type: ${{ inputs.release-type }}
+          package-name: ${{ inputs.package-name || github.event.repository.name }}
+          token: ${{ secrets.GITHUB_TOKEN }}

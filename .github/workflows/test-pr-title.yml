@@ -1,0 +1,34 @@
+name: test-pr-title
+
+# Validates that the PR title follows Conventional Commits. release-please
+# keys off the title prefix to decide what kind of version bump (or no bump)
+# the merge produces — a wrong title means no release ever cuts.
+#
+# Centralised here so every ewws-tagged repo enforces the same regex without
+# copy-paste drift. Pin a tag for stability; pin @main for the rolling tip.
+
+on:
+  workflow_call:
+    inputs:
+      types:
+        description: "Allowed type prefixes (comma-separated). Default mirrors the conventional-commit spec + release-please's recognised set."
+        type: string
+        default: "feat,fix,chore,docs,refactor,perf,test,build,ci,style,revert"
+
+permissions:
+  pull-requests: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      # amannn/action-semantic-pull-request@v5.5.3 — pin by SHA per repo policy.
+      - uses: amannn/action-semantic-pull-request@0723387faaf9b38adef4775cd42cfd5155ed6017
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          types: ${{ inputs.types }}
+          # Subject doesn't have to start uppercase — mirrors mekorp / ewws style.
+          subjectPattern: ".+"
+          # Multiple commits in one PR don't matter; we only check the merge-commit title.
+          validateSingleCommit: false
