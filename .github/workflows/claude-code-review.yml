@@ -52,7 +52,7 @@ on:
         type: string
         default: ""
     secrets:
-      anthropic-token:
+      anthropic_token:
         description: "Claude Code OAuth token (sk-ant-oat0…). The organisation secret ANTHROPIC_API_KEY holds one despite its name."
         required: true
 
@@ -85,7 +85,7 @@ jobs:
           # via `anthropic_api_key` sends it as x-api-key and fails with a 401 —
           # which is worth knowing because the organisation secret that holds one
           # is named ANTHROPIC_API_KEY.
-          claude_code_oauth_token: ${{ secrets.anthropic-token }}
+          claude_code_oauth_token: ${{ secrets.anthropic_token }}
           track_progress: true
           prompt: |
             REPO: ${{ github.repository }}

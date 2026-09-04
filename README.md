@@ -114,7 +114,7 @@ jobs:
         Errors are wrapped with context and never dropped.
         No new dependency without a reason stated in the pull request.
     secrets:
-      anthropic-token: ${{ secrets.ANTHROPIC_API_KEY }}
+      anthropic_token: ${{ secrets.ANTHROPIC_API_KEY }}
 ```
 
 `extra-instructions` is where a repository's red lines go — the rules that get
