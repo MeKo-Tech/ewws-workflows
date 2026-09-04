@@ -21,6 +21,7 @@ This repo centralizes the workflows. Each is exposed via `workflow_call` so a co
 | `release-please.yml` | Cuts release PRs + tags from Conventional Commits. Default `release-type: simple` reads version from `version.txt`. | `release-type`, `version-file` |
 | `build-and-push.yml` | Multi-arch (amd64+arm64) Docker build, pushes to `ghcr.io`. Tags: branch name, PR ref, semver, `sha-<short>`. | `image-name`, `dockerfile`, `platforms` |
 | `go-lint.yml` | `golangci-lint v2` for Go modules. | `go-version` |
+| `claude-code-review.yml` | Claude reviews every non-draft pull request once, and comments only — no write access to the repository. | `runner`, `timeout-minutes`, `guidelines`, `extra-instructions`, `ci-workflow` |
 
 ## Quick-start (consumer repo)
 
@@ -75,6 +76,64 @@ jobs:
       image-name: ghcr.io/meko-tech/${{ github.event.repository.name }}
     secrets: inherit
 ```
+
+## `claude-code-review.yml`
+
+One review per pull request, on `opened` / `ready_for_review` / `reopened`. No
+`synchronize`: a push does not buy a second review. Drafts, `release-please--*`
+and `dependabot/*` branches are skipped.
+
+The caller declares the permissions — a reusable workflow cannot grant itself
+more than it is given — and passes the organisation token:
+
+```yaml
+name: claude-code-review
+
+on:
+  pull_request:
+    types: [opened, ready_for_review, reopened]
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: read
+  id-token: write # the action exchanges the OIDC token for its GitHub App token
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  review:
+    uses: MeKo-Tech/ewws-workflows/.github/workflows/claude-code-review.yml@main
+    with:
+      runner: '["ewws-arc-ci-hetzner"]'
+      guidelines: AGENTS.md and CLAUDE.md
+      ci-workflow: tests.yaml
+      extra-instructions: |
+        Errors are wrapped with context and never dropped.
+        No new dependency without a reason stated in the pull request.
+    secrets:
+      anthropic_token: ${{ secrets.ANTHROPIC_API_KEY }}
+```
+
+`extra-instructions` is where a repository's red lines go — the rules that get
+buried among smaller findings unless the review is told to name them. Keep it to
+what is specific: the generic half (correctness, scope, reuse, security, test
+coverage, `file:line` references, blocker / should-fix / nice-to-have) is already
+in the workflow.
+
+Two things to know before adopting it:
+
+- **One token, one rate limit.** `ANTHROPIC_API_KEY` is a single organisation
+  secret, shared with the `pr-auto-rebase` sweeps. Every repository added here
+  draws on it.
+- **The pull request that adds the caller cannot be reviewed by it.** The action
+  validates the caller's workflow file against the copy on the default branch and
+  skips itself when the two differ — the guard that stops a pull request from
+  rewriting the reviewer that is about to review it. That run goes green having
+  posted nothing, and says so in one warning in the middle of the log. It starts
+  working on the next pull request.
 
 ## Conventions enforced
 
