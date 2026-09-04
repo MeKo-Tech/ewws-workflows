@@ -21,7 +21,7 @@ This repo centralizes the workflows. Each is exposed via `workflow_call` so a co
 | `release-please.yml` | Cuts release PRs + tags from Conventional Commits. Default `release-type: simple` reads version from `version.txt`. | `release-type`, `version-file` |
 | `build-and-push.yml` | Multi-arch (amd64+arm64) Docker build, pushes to `ghcr.io`. Tags: branch name, PR ref, semver, `sha-<short>`. | `image-name`, `dockerfile`, `platforms` |
 | `go-lint.yml` | `golangci-lint v2` for Go modules. | `go-version` |
-| `claude-code-review.yml` | Claude reviews every non-draft pull request once, and comments only — no write access to the repository. | `runner`, `timeout-minutes`, `guidelines`, `extra-instructions`, `ci-workflow` |
+| `claude-code-review.yml` | Claude reviews every non-draft pull request from a human, and comments only — no write access to the repository. | `runner`, `timeout-minutes`, `guidelines`, `extra-instructions`, `ci-workflow` |
 
 ## Quick-start (consumer repo)
 
@@ -79,9 +79,12 @@ jobs:
 
 ## `claude-code-review.yml`
 
-One review per pull request, on `opened` / `ready_for_review` / `reopened`. No
-`synchronize`: a push does not buy a second review. Drafts, `release-please--*`
-and `dependabot/*` branches are skipped.
+One review per lifecycle event: `opened`, `ready_for_review`, `reopened`. No
+`synchronize`, so a push does not buy a second review — but reopening a pull
+request, or sending it back to draft and marking it ready again, deliberately
+does. Skipped: drafts, `release-please--*` and `dependabot/*` branches,
+pull requests opened by a bot, and pull requests from a fork, which GitHub gives
+no access to the organisation secret.
 
 The caller declares the permissions — a reusable workflow cannot grant itself
 more than it is given — and passes the organisation token:
@@ -123,8 +126,14 @@ what is specific: the generic half (correctness, scope, reuse, security, test
 coverage, `file:line` references, blocker / should-fix / nice-to-have) is already
 in the workflow.
 
-Two things to know before adopting it:
+Three things to know before adopting it:
 
+- **The review reads its guidelines from the base branch.** The job checks the
+  base revision out a second time, into `.review-base/`, and the session is told
+  to take `guidelines` from there. Otherwise a pull request could edit the file
+  that instructs the reviewer reading it — the hole the action's own
+  workflow-file guard closes for the workflow, left open for everything the
+  workflow points at.
 - **One token, one rate limit.** `ANTHROPIC_API_KEY` is a single organisation
   secret, shared with the `pr-auto-rebase` sweeps. Every repository added here
   draws on it.
