@@ -1,0 +1,124 @@
+name: claude-code-review
+
+# A first review pass on every pull request, before a human opens it.
+#
+# The job comments and nothing else: `contents` stays read-only and the allow
+# list admits read-only `gh` calls plus the two comment paths. Nothing here can
+# push, and nothing can be steered into pushing by the diff it is reading.
+#
+# What it must not do is repeat CI. Lint, type-check, tests and the build report
+# themselves, and a second opinion on a red check is noise. This pass is for what
+# a checker cannot see: correctness, scope, reuse, and the consumer's own written
+# guidelines.
+#
+# What is generic lives here; what is repository-specific arrives as an input.
+# `guidelines` names the files the session must read, `extra-instructions` holds
+# the red lines worth naming explicitly — the rules that get buried among smaller
+# findings when nobody asks for them by name.
+#
+# Two things to know before adopting it:
+#
+#   * The Claude token is one organisation secret against one rate limit, shared
+#     with the pr-auto-rebase sweeps. Every repository added here draws on it.
+#
+#   * The action validates the caller's workflow file against the copy on the
+#     default branch and skips itself when the two differ — the guard that stops
+#     a pull request from rewriting the reviewer that is about to review it. So
+#     the pull request that adds the caller cannot be reviewed by it; the job
+#     goes green having posted nothing, and says so in one warning in the middle
+#     of the log. It starts working on the next pull request, after the merge.
+
+on:
+  workflow_call:
+    inputs:
+      runner:
+        description: "runs-on value as a JSON array, e.g. '[\"ewws-arc-ci-hetzner\"]'"
+        type: string
+        default: '["ubuntu-latest"]'
+      timeout-minutes:
+        description: "Job timeout. Without one a hung session squats a runner slot for GitHub's 360m default."
+        type: number
+        default: 30
+      guidelines:
+        description: "Files the session must read before reviewing, e.g. 'AGENTS.md and CLAUDE.md'. Empty means it reads whatever it finds."
+        type: string
+        default: ""
+      extra-instructions:
+        description: "Repository-specific review instructions, appended to the generic prompt. The place for red lines worth naming."
+        type: string
+        default: ""
+      ci-workflow:
+        description: "Workflow whose checks the review must not restate, e.g. 'tests.yaml'."
+        type: string
+        default: ""
+    secrets:
+      anthropic-token:
+        description: "Claude Code OAuth token (sk-ant-oat0…). The organisation secret ANTHROPIC_API_KEY holds one despite its name."
+        required: true
+
+jobs:
+  claude-review:
+    # Skip drafts, the release-please changelog pull requests and dependabot —
+    # none of the three is worth a review.
+    if: |
+      github.event.pull_request.draft == false &&
+      !startsWith(github.head_ref, 'release-please--') &&
+      !startsWith(github.head_ref, 'dependabot/')
+
+    runs-on: ${{ fromJSON(inputs.runner) }}
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+
+    steps:
+      # actions/checkout@v4.2.2
+      #
+      # Shallow on purpose: the session reads the diff through `gh pr diff`, so
+      # there is nothing here for a merge base to be useful for.
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          fetch-depth: 1
+
+      # anthropics/claude-code-action@v1.0.201
+      - name: Run Claude Code Review
+        uses: anthropics/claude-code-action@c81e3bc69d1b18badbb63ba39581218f02421678
+        with:
+          # A Claude Code OAuth token authenticates as a bearer token. Passing it
+          # via `anthropic_api_key` sends it as x-api-key and fails with a 401 —
+          # which is worth knowing because the organisation secret that holds one
+          # is named ANTHROPIC_API_KEY.
+          claude_code_oauth_token: ${{ secrets.anthropic-token }}
+          track_progress: true
+          prompt: |
+            REPO: ${{ github.repository }}
+            PR NUMBER: ${{ github.event.pull_request.number }}
+
+            Review this pull request.
+
+            Read the full diff with `gh pr diff` first — the checkout is shallow,
+            so there is no merge base to diff against locally.
+
+            Review for correctness first: bugs, unhandled errors, races, missing
+            cases. Then scope (files changed that the task did not call for),
+            reuse (something added that already exists in this repository),
+            security, and test coverage for the behaviour that changed.
+
+            Give every finding a `file:line` reference and group them as
+            blocker / should-fix / nice-to-have. Say explicitly when you find
+            nothing — a review that reports nothing must be distinguishable from
+            a review that did not happen.
+
+            ${{ inputs.guidelines != '' && format('Read {0} and hold the diff to what they require.', inputs.guidelines) || 'Read the repository''s AGENTS.md or CLAUDE.md if either exists, and hold the diff to what it requires.' }}
+
+            ${{ inputs.extra-instructions }}
+
+            ${{ inputs.ci-workflow != '' && format('Do not repeat what CI already reports: {0} runs the checks and reports itself. Review what a checker cannot see.', inputs.ci-workflow) || 'Do not repeat what CI already reports. Review what a checker cannot see.' }}
+
+            Be constructive: say what is wrong, why it matters, and what to do
+            instead. Do not pad the review with praise or with restatements of
+            what the diff does.
+
+            Use `gh pr comment` for the top-level summary, and
+            `mcp__github_inline_comment__create_inline_comment` (with `confirmed: true`)
+            for issues tied to a specific line. Only post GitHub comments — do not
+            return the review as a chat message.
+          claude_args: |
+            --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh pr list:*),Bash(gh issue view:*),Bash(gh issue list:*),Bash(gh search:*)"
