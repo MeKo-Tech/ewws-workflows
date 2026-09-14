@@ -1,0 +1,84 @@
+name: build-and-push
+
+# Multi-arch (amd64 + arm64) Docker build, pushed to ghcr.io. Tags follow
+# the metadata-action convention so the cluster image-updater + the
+# platform-UI drift detector can both parse them:
+#
+#   type=ref,event=branch      → e.g. "main" or "deploy/foo"
+#   type=ref,event=pr          → "pr-123"
+#   type=semver,pattern={...}  → "1.2.3" + "1.2" + "1"
+#   type=sha,prefix=sha-       → "sha-c69034c" (git short SHA)
+#
+# The `sha-*` tag is the one platform-UI's drift detector strips the
+# prefix from to feed into the GitHub compare API.
+
+on:
+  workflow_call:
+    inputs:
+      image-name:
+        description: "Full OCI image name without tag. Conventional value: `ghcr.io/meko-tech/<repo>`."
+        type: string
+        required: true
+      dockerfile:
+        description: "Path to the Dockerfile relative to repo root."
+        type: string
+        default: ./Dockerfile
+      context:
+        description: "Build context dir."
+        type: string
+        default: .
+      platforms:
+        description: "Comma-separated platforms for buildx. Default amd64 + arm64."
+        type: string
+        default: linux/amd64,linux/arm64
+      push:
+        description: "Whether to push the image (skip for PR previews)."
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      # All action SHAs below are copied from a known-working workflow so
+      # we avoid the "unable to resolve action" trap from a typo'd SHA.
+      # actions/checkout@v7.0.1 — v4 runs on Node 20, which the runners now
+      # force onto Node 24 and warn about on every run.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      # docker/setup-qemu-action@v3.2.0
+      - uses: docker/setup-qemu-action@49b3bc8e6bdd4a60e6116a5414239cba5943d3cf
+      # docker/setup-buildx-action@v3.7.1
+      - uses: docker/setup-buildx-action@c47758b77c9736f4b2ef4073d4d51994fabfe349
+      # docker/login-action@v3.3.0 — `secrets: inherit` from caller gives us GITHUB_TOKEN.
+      - uses: docker/login-action@9780b0c442fbb1117ed29e0efdff1e18412f7567
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      # docker/metadata-action@v5.5.1
+      - id: meta
+        uses: docker/metadata-action@8e5442c4ef9f78752691e2d8f8d19755c6f78e81
+        with:
+          images: ${{ inputs.image-name }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            type=sha,prefix=sha-
+      # docker/build-push-action@v6.9.0
+      - uses: docker/build-push-action@4f58ea79222b3b9dc2c8bbdd6debcef730109a75
+        with:
+          context: ${{ inputs.context }}
+          file: ${{ inputs.dockerfile }}
+          platforms: ${{ inputs.platforms }}
+          push: ${{ inputs.push && github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
