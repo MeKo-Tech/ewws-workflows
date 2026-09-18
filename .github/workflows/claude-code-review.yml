@@ -52,6 +52,14 @@ on:
         description: "Workflow whose checks the review must not restate, e.g. 'tests.yaml'."
         type: string
         default: ""
+      allowed-bots:
+        description: >-
+          Bot actors whose pull requests may be reviewed, comma-separated, e.g.
+          'my-app[bot]'. Empty — the default — means none: the action aborts on a
+          pull request opened by an App. Name the bots you want; '*' admits every
+          App that ever opens one.
+        type: string
+        default: ""
     secrets:
       anthropic_token:
         description: "Claude Code OAuth token (sk-ant-oat0…). The organisation secret ANTHROPIC_API_KEY holds one despite its name."
@@ -91,6 +99,12 @@ jobs:
           # is named ANTHROPIC_API_KEY.
           claude_code_oauth_token: ${{ secrets.anthropic_token }}
           track_progress: true
+          # The action refuses to run for a non-human actor — it authenticates,
+          # then aborts with "Workflow initiated by non-human actor: <app>
+          # (type: Bot)". A caller whose pull requests are opened by a GitHub App
+          # names that App here. Empty is the action's own default and keeps the
+          # refusal, so a caller that passes nothing is unaffected.
+          allowed_bots: ${{ inputs.allowed-bots }}
           prompt: |
             REPO: ${{ github.repository }}
             PR NUMBER: ${{ github.event.pull_request.number }}
