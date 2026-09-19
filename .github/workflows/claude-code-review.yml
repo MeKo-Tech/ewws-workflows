@@ -113,6 +113,7 @@ jobs:
 
       # anthropics/claude-code-action@v1.0.201
       - name: Run Claude Code Review
+        id: review
         uses: anthropics/claude-code-action@c81e3bc69d1b18badbb63ba39581218f02421678
         with:
           # A Claude Code OAuth token authenticates as a bearer token. Passing it
@@ -163,3 +164,124 @@ jobs:
           claude_args: |
             --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh pr list:*),Bash(gh issue view:*),Bash(gh issue list:*),Bash(gh search:*)"
             ${{ inputs.model != '' && format('--model {0}', inputs.model) || '' }}
+
+      # The session's own output never reaches the log — the action prints
+      # "full output hidden for security" and writes it to a file instead. When a
+      # review ends without publishing, its findings therefore die with the
+      # runner: the log keeps a denial *count* and nothing that says what was
+      # denied or what the review had found.
+      #
+      # always(), because the run worth keeping is precisely the one that
+      # published nothing.
+      #
+      # actions/upload-artifact@v7.0.1
+      - name: Preserve the session output
+        if: always() && steps.review.outputs.execution_file != ''
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: claude-review-output-${{ github.event.pull_request.number }}
+          path: ${{ steps.review.outputs.execution_file }}
+          if-no-files-found: warn
+          retention-days: 14
+
+      # A review that published nothing must not report success.
+      #
+      # The action returns `is_error: false` whenever the session ends on its own
+      # terms — including when it spends its entire budget on denied tool calls
+      # and never reaches `gh pr comment`. Observed on moin-bridge#2397: 66 turns,
+      # 19 permission denials, no comment, check green. A green check that proves
+      # nothing is worse than a red one, because it gets read as evidence.
+      #
+      # `track_progress` posts a tracking comment before the session starts, so
+      # its mere existence proves only that the job ran. It is also, usually, the
+      # place the review ends up: the session ticks its checklist and rewrites
+      # that same comment in place with the full review. Counting "comments that
+      # are not the tracker" would therefore fail the normal path — verified
+      # against moin-bridge#2981, #2966 and #2977, which each published a complete
+      # review into the tracker and posted no inline comment at all.
+      #
+      # What separates those from the silent run is the checklist: a session that
+      # finished leaves every box ticked, while moin-bridge#2397 stopped with
+      # three still open, "Post summary" among them. So the signal is an open box
+      # with no comment anywhere; any inline or standalone comment counts as
+      # published regardless.
+      #
+      # `outcome == 'success'` alone is not enough to know a session ran. The
+      # action also reports success when it *self-skips* — it refuses to review a
+      # pull request whose copy of the caller's workflow file differs from the
+      # default branch's, warning "Skipping action due to workflow validation",
+      # which is exactly what every pull request that edits this reviewer does.
+      # No session means no tracker and no comments, so the check below would
+      # read a perfectly good pull request as having published nothing.
+      #
+      # `execution_file` is the discriminator: the action writes it whenever a
+      # session actually ran, and a self-skipped run produces none. Requiring it
+      # costs no detection power, because the silent run this guard exists for
+      # did produce one.
+      #
+      # Every count is scoped to the current run, because a pull request carries
+      # the comments of every review it has ever had. Unscoped, this guard is
+      # defeated by history: moin-bridge#2397 now holds its silent run's tracker
+      # (three boxes still open) *and* a later, complete review, so reading the
+      # newest tracker reports zero open boxes and passes the very run the guard
+      # exists to catch. The same hole opens on every re-run and every `reopened`
+      # event — precisely the pull requests already reviewed once.
+      # `run_started_at` is the boundary: GitHub resets it on each re-run
+      # attempt, and it is stamped by the same clock as the comment timestamps,
+      # so the two compare directly as strings. It is not available as a context
+      # property — `github.run_started_at` does not exist — so it comes from the
+      # API, which is why a caller must grant `actions: read`. All current
+      # callers do.
+      #
+      # The counts are lines, not a jq `length`: `--paginate` applies `--jq` to
+      # each page separately, so a `length` on a pull request spanning several
+      # pages yields one number per page, and `[ "${inline}" -gt 0 ]` then dies
+      # on "integer expression expected" under `set -e`. Emitting one id per
+      # match and counting lines accumulates across pages instead. `--slurp`
+      # would be the other way out, but gh refuses it together with `--jq`. Same
+      # reason for `@base64` on the tracker body: it keeps a multi-line body on
+      # one line so `tail -n 1` can pick the newest.
+      - name: Fail if the review published nothing
+        if: >-
+          always() && steps.review.outcome == 'success'
+          && steps.review.outputs.execution_file != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+          TARGET_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          since=$(gh api "repos/${TARGET_REPO}/actions/runs/${GITHUB_RUN_ID}" \
+            --jq '.run_started_at')
+          echo "counting what claude[bot] published since ${since}"
+
+          # `gh api --jq` takes the program and nothing else — it rejects `--arg`
+          # with "accepts 1 arg(s), received 4" — so the boundary is interpolated
+          # into the program. It comes from the GitHub API, not from the pull
+          # request, so there is no untrusted text in it.
+          mine="select(.user.login == \"claude[bot]\")
+                | select(.created_at >= \"${since}\" or .updated_at >= \"${since}\")"
+
+          inline=$(gh api "repos/${TARGET_REPO}/pulls/${PR}/comments" --paginate \
+            --jq ".[] | ${mine} | .id" | wc -l | tr -d ' ')
+          standalone=$(gh api "repos/${TARGET_REPO}/issues/${PR}/comments" --paginate \
+            --jq ".[] | ${mine}
+                  | select((.body | startswith(\"**Claude finished\")) | not)
+                  | .id" | wc -l | tr -d ' ')
+          tracker=$(gh api "repos/${TARGET_REPO}/issues/${PR}/comments" --paginate \
+            --jq ".[] | ${mine} | .body | @base64" | tail -n 1 | base64 -d)
+
+          unticked=$(printf '%s' "${tracker}" | grep -c -- '- \[ \]' || true)
+
+          echo "claude[bot]: ${inline} inline, ${standalone} standalone, ${unticked} unticked checklist box(es)"
+
+          if [ "${inline}" -gt 0 ] || [ "${standalone}" -gt 0 ]; then
+            exit 0
+          fi
+          if [ -n "${tracker}" ] && [ "${unticked}" -eq 0 ]; then
+            exit 0
+          fi
+
+          echo "::error::The review session finished successfully but published nothing — no inline comments, no summary, and ${unticked} checklist item(s) left open. Its findings are in the claude-review-output artifact on this run. Re-run the review; do not read this check as a clean review."
+          exit 1
