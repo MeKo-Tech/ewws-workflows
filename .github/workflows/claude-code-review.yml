@@ -60,6 +60,13 @@ on:
           App that ever opens one.
         type: string
         default: ""
+      model:
+        description: >-
+          Model the review runs on. Opus by default: there is one review per pull
+          request, so the stronger model is worth its usage. Empty leaves the
+          choice to Claude Code, which currently picks Sonnet.
+        type: string
+        default: claude-opus-5-5
     secrets:
       anthropic_token:
         description: "Claude Code OAuth token (sk-ant-oat0…). The organisation secret ANTHROPIC_API_KEY holds one despite its name."
@@ -88,6 +95,21 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           fetch-depth: 1
+
+      # `model` lands in `claude_args` unescaped, where every further `--…`
+      # token is read as another CLI option — `x --allowedTools Bash(*)` would
+      # widen the review's permissions. Admit a single token of model-ID
+      # characters only (e.g. claude-opus-5-5, opus, claude-opus-5-5[1m]).
+      - name: Validate model
+        env:
+          MODEL: ${{ inputs.model }}
+        run: |
+          # `]` first and `-` last are literal inside a POSIX bracket expression.
+          pattern='^[A-Za-z0-9][]A-Za-z0-9._:@[-]*$'
+          if [[ -n "$MODEL" && ! "$MODEL" =~ $pattern ]]; then
+            echo "::error::Invalid model input: must be a single model ID, got '$MODEL'"
+            exit 1
+          fi
 
       # anthropics/claude-code-action@v1.0.201
       - name: Run Claude Code Review
@@ -140,3 +162,4 @@ jobs:
             return the review as a chat message.
           claude_args: |
             --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh pr list:*),Bash(gh issue view:*),Bash(gh issue list:*),Bash(gh search:*)"
+            ${{ inputs.model != '' && format('--model {0}', inputs.model) || '' }}
