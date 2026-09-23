@@ -96,6 +96,21 @@ jobs:
         with:
           fetch-depth: 1
 
+      # `model` lands in `claude_args` unescaped, where every further `--…`
+      # token is read as another CLI option — `x --allowedTools Bash(*)` would
+      # widen the review's permissions. Admit a single token of model-ID
+      # characters only (e.g. claude-opus-5-5, opus, claude-opus-5-5[1m]).
+      - name: Validate model
+        env:
+          MODEL: ${{ inputs.model }}
+        run: |
+          # `]` first and `-` last are literal inside a POSIX bracket expression.
+          pattern='^[A-Za-z0-9][]A-Za-z0-9._:@[-]*$'
+          if [[ -n "$MODEL" && ! "$MODEL" =~ $pattern ]]; then
+            echo "::error::Invalid model input: must be a single model ID, got '$MODEL'"
+            exit 1
+          fi
+
       # anthropics/claude-code-action@v1.0.201
       - name: Run Claude Code Review
         uses: anthropics/claude-code-action@c81e3bc69d1b18badbb63ba39581218f02421678
