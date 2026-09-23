@@ -60,6 +60,13 @@ on:
           App that ever opens one.
         type: string
         default: ""
+      model:
+        description: >-
+          Model the review runs on. Opus by default: there is one review per pull
+          request, so the stronger model is worth its usage. Empty leaves the
+          choice to Claude Code, which currently picks Sonnet.
+        type: string
+        default: claude-opus-5-5
     secrets:
       anthropic_token:
         description: "Claude Code OAuth token (sk-ant-oat0…). The organisation secret ANTHROPIC_API_KEY holds one despite its name."
@@ -140,3 +147,4 @@ jobs:
             return the review as a chat message.
           claude_args: |
             --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh pr list:*),Bash(gh issue view:*),Bash(gh issue list:*),Bash(gh search:*)"
+            ${{ inputs.model != '' && format('--model {0}', inputs.model) || '' }}

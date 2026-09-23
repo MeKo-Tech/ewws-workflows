@@ -13,7 +13,7 @@ consumer repository calls it with a single `uses:` entry.
 | `release-please.yml` | Cuts release pull requests and tags from Conventional Commits. Outputs `released` and `tag-name`. | `release-type`, `package-name`, `config-file`, `manifest-file` |
 | `build-and-push.yml` | Multi-arch (amd64 + arm64) Docker build, pushed to `ghcr.io`. | `image-name` (required), `dockerfile`, `context`, `platforms`, `push` |
 | `go-lint.yml` | `golangci-lint` v2 for Go modules. | `go-version`, `golangci-lint-version`, `working-directory` |
-| `claude-code-review.yml` | One Claude review per non-draft pull request; comments only. | `runner`, `timeout-minutes`, `guidelines`, `extra-instructions`, `ci-workflow` |
+| `claude-code-review.yml` | One Claude review per non-draft pull request; comments only. | `runner`, `timeout-minutes`, `guidelines`, `extra-instructions`, `ci-workflow`, `model` |
 
 ## Calling them
 
@@ -104,3 +104,6 @@ jobs:
 The job runs on `ubuntu-latest` unless `runner` passes a different `runs-on`
 value as a JSON array. Drafts and `release-please--*` / `dependabot/*` branches
 are skipped.
+
+The review runs on `claude-opus-5-5` unless `model` names another; an empty
+`model` leaves the choice to Claude Code's default.
