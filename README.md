@@ -13,7 +13,7 @@ consumer repository calls it with a single `uses:` entry.
 | `release-please.yml` | Cuts release pull requests and tags from Conventional Commits. Outputs `released` and `tag-name`. | `release-type`, `package-name`, `config-file`, `manifest-file` |
 | `build-and-push.yml` | Multi-arch (amd64 + arm64) Docker build, pushed to `ghcr.io`. | `image-name` (required), `dockerfile`, `context`, `platforms`, `push` |
 | `go-lint.yml` | `golangci-lint` v2 for Go modules. | `go-version`, `golangci-lint-version`, `working-directory` |
-| `claude-code-review.yml` | One Claude review per non-draft pull request from a human (or an `allowed-bots` App); comments only. Guidelines are read from the base branch, out of the pull request's reach. | `runner`, `timeout-minutes`, `guidelines`, `extra-instructions`, `ci-workflow`, `allowed-bots`, `model` |
+| `claude-code-review.yml` | One Claude review per non-draft pull request, triggered by a human or an `allowed-bots` App; comments only. Guidelines are read from the base branch, out of the pull request's reach. | `runner`, `timeout-minutes`, `guidelines`, `extra-instructions`, `ci-workflow`, `allowed-bots`, `model` |
 
 ## Calling them
 
@@ -103,8 +103,8 @@ jobs:
 
 The job runs on `ubuntu-latest` unless `runner` passes a different `runs-on`
 value as a JSON array. Skipped: drafts, `release-please--*` and `dependabot/*`
-branches, pull requests opened by a bot unless `allowed-bots` names some,
-and pull requests from a fork — GitHub withholds the organisation secret from a
+branches, events triggered by a bot unless `allowed-bots` names some, and
+pull requests from a fork — GitHub withholds the organisation secret from a
 fork, so the review could only fail there.
 
 **The review reads its guidelines from the base branch.** The job checks the
@@ -116,3 +116,8 @@ workflow points at.
 
 The review runs on `claude-opus-5-5` unless `model` names another; an empty
 `model` leaves the choice to Claude Code's default.
+
+A review session that ends without publishing anything fails the job instead of
+going green. On a private repository its transcript is kept for 14 days as the
+`claude-review-output-<pr>-<attempt>` artifact of the run; on a public one it
+is not uploaded, because the action hides that output for a reason.

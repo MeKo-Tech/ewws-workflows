@@ -91,12 +91,18 @@ jobs:
     # The `release-please--` test above stays load-bearing — those pull
     # requests come from a user account, not from a bot.
     #
+    # The test is on `sender`, the account that triggered the event, because
+    # that is what the action refuses: it aborts on a bot actor, not on a bot
+    # author. Testing the author instead would let a bot's `reopened` on a
+    # human's pull request through to that abort, and skip a human's
+    # `reopened` on a bot's pull request that the action would have reviewed.
+    #
     # Forks are skipped because the review cannot run there: GitHub withholds
     # secrets from a `pull_request` event on a fork, so the token arrives empty
     # and the action fails with a 401. Skipping says so; failing does not.
     if: |
       github.event.pull_request.draft == false &&
-      (github.event.pull_request.user.type != 'Bot' || inputs.allowed-bots != '') &&
+      (github.event.sender.type != 'Bot' || inputs.allowed-bots != '') &&
       github.event.pull_request.head.repo.fork == false &&
       !startsWith(github.head_ref, 'release-please--') &&
       !startsWith(github.head_ref, 'dependabot/')
@@ -150,6 +156,11 @@ jobs:
           path: .review-base
 
       # anthropics/claude-code-action@v1.0.201
+      #
+      # Bumping this pin means re-verifying "Fail if the review published
+      # nothing" below: it reads the action's own output format — the
+      # `claude[bot]` login, the `**Claude finished` header and the `- [ ]`
+      # checklist of the tracking comment — none of which is a stable contract.
       - name: Run Claude Code Review
         id: review
         uses: anthropics/claude-code-action@c81e3bc69d1b18badbb63ba39581218f02421678
@@ -219,12 +230,24 @@ jobs:
       # always(), because the run worth keeping is precisely the one that
       # published nothing.
       #
+      # Private repositories only. The action hides that output because tool
+      # results may carry secrets and Actions logs on a public repository are
+      # public; an artifact there is downloadable by any signed-in GitHub user,
+      # so uploading it would undo exactly that. The artifact lands in the
+      # caller's run, so it is the caller's visibility that counts, not this
+      # repository's.
+      #
+      # The run attempt is in the name so that a re-run keeps its own transcript
+      # next to the one it was re-run for.
+      #
       # actions/upload-artifact@v7.0.1
       - name: Preserve the session output
-        if: always() && steps.review.outputs.execution_file != ''
+        if: >-
+          always() && steps.review.outputs.execution_file != ''
+          && github.event.repository.private
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
-          name: claude-review-output-${{ github.event.pull_request.number }}
+          name: claude-review-output-${{ github.event.pull_request.number }}-${{ github.run_attempt }}
           path: ${{ steps.review.outputs.execution_file }}
           if-no-files-found: warn
           retention-days: 14
@@ -294,6 +317,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           PR: ${{ github.event.pull_request.number }}
           TARGET_REPO: ${{ github.repository }}
+          PRIVATE_REPO: ${{ github.event.repository.private }}
         run: |
           set -euo pipefail
 
@@ -328,5 +352,10 @@ jobs:
             exit 0
           fi
 
-          echo "::error::The review session finished successfully but published nothing — no inline comments, no summary, and ${unticked} checklist item(s) left open. Its findings are in the claude-review-output artifact on this run. Re-run the review; do not read this check as a clean review."
+          if [ "${PRIVATE_REPO}" = "true" ]; then
+            where="Its transcript is in the claude-review-output artifact on this run."
+          else
+            where="The transcript is not uploaded on a public repository."
+          fi
+          echo "::error::The review session finished successfully but published nothing — no inline comments, no summary, and ${unticked} checklist item(s) left open. ${where} Re-run the review; do not read this check as a clean review."
           exit 1
