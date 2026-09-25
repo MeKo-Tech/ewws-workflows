@@ -155,7 +155,7 @@ jobs:
           fetch-depth: 1
           path: .review-base
 
-      # anthropics/claude-code-action@v1.0.201
+      # anthropics/claude-code-action@v1.0.234
       #
       # Bumping this pin means re-verifying "Fail if the review published
       # nothing" below: it reads the action's own output format — the
@@ -163,7 +163,7 @@ jobs:
       # checklist of the tracking comment — none of which is a stable contract.
       - name: Run Claude Code Review
         id: review
-        uses: anthropics/claude-code-action@c81e3bc69d1b18badbb63ba39581218f02421678
+        uses: anthropics/claude-code-action@9171db3e57d6a3140a37ddc2ba92788584e0ead6
         with:
           # A Claude Code OAuth token authenticates as a bearer token. Passing it
           # via `anthropic_api_key` sends it as x-api-key and fails with a 401 —
@@ -251,6 +251,24 @@ jobs:
           path: ${{ steps.review.outputs.execution_file }}
           if-no-files-found: warn
           retention-days: 14
+
+      # A session that ends with `is_error: true` leaves only "result
+      # is_error:true" in the log; the reason — an API error such as "Claude
+      # Code 2.1.241 does not support this model" — sits in the hidden output.
+      # Surface that final result text, and only when the session errored, so a
+      # public repository's log gains an error message and not review content.
+      # Truncated, because an error result has no business being long.
+      - name: Report why the review session failed
+        if: >-
+          failure() && steps.review.outcome == 'failure'
+          && steps.review.outputs.execution_file != ''
+        env:
+          EXECUTION_FILE: ${{ steps.review.outputs.execution_file }}
+        run: |
+          reason=$(jq -r '[.[] | select(.type == "result" and .is_error == true)] | last | .result // empty' "$EXECUTION_FILE" 2>/dev/null | head -c 500 | tr '\n' ' ')
+          if [[ -n "$reason" ]]; then
+            echo "::error title=Claude review session failed::$reason"
+          fi
 
       # A review that published nothing must not report success.
       #
