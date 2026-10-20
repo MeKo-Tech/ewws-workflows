@@ -43,13 +43,13 @@ jobs:
       released: ${{ steps.rp.outputs.release_created }}
       tag-name: ${{ steps.rp.outputs.tag_name }}
     steps:
-      # googleapis/release-please-action@v4.3.0 — pin by SHA per repo policy.
+      # googleapis/release-please-action@v5.0.0 — pin by SHA per repo policy.
       #
       # The action accepts EITHER release-type (simple repos with one
       # package) OR config-file/manifest-file (multi-package layout).
       # When `config-file` is set the action ignores release-type.
       - id: rp
-        uses: googleapis/release-please-action@a02a34c4d625f9be7cb89156071d8567266a2445
+        uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7
         with:
           release-type: ${{ inputs.release-type }}
           package-name: ${{ inputs.package-name || github.event.repository.name }}

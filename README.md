@@ -41,7 +41,7 @@ jobs:
   go-lint:
     uses: MeKo-Tech/ewws-workflows/.github/workflows/go-lint.yml@v1
     with:
-      go-version: "1.25.x"
+      go-version: "1.27"
 ```
 
 ### `release-please.yml`
