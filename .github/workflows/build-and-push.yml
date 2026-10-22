@@ -97,14 +97,16 @@ jobs:
           # then absent rather than empty.
           secrets: ${{ secrets.gh-pat != '' && format('gh_pat={0}', secrets.gh-pat) || '' }}
       # Taken from the metadata-action tag list, so it is exactly the tag that
-      # was pushed — not a re-derivation of the short SHA.
+      # was pushed — not a re-derivation of the short SHA. The list is sorted by
+      # priority and `type=sha` has the lowest, so the LAST match is the commit
+      # tag; a branch named `sha-…` would come first.
       - id: sha-tag
         if: inputs.push && github.event_name != 'pull_request'
         env:
           TAGS: ${{ steps.meta.outputs.tags }}
         run: |
           set -euo pipefail
-          tag=$(printf '%s\n' "$TAGS" | sed -n 's/^.*:\(sha-[0-9a-f]*\)$/\1/p' | head -n 1)
+          tag=$(printf '%s\n' "$TAGS" | sed -n 's/^.*:\(sha-[0-9a-f]*\)$/\1/p' | tail -n 1)
           if [[ -z "$tag" ]]; then
             echo "::error::no sha-* tag among the pushed tags"
             exit 1

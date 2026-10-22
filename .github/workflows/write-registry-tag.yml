@@ -190,9 +190,14 @@ jobs:
               exit 1
             fi
             local backend="" frontend="" old_backend="" old_frontend=""
+            # write_tags runs under `if`, which switches errexit off inside it: a
+            # failed read must abort explicitly, or the kept tag would be dropped.
             if [[ -f "$file" ]]; then
-              old_backend=$(yq -r '.imageTags.backend // ""' "$file")
-              old_frontend=$(yq -r '.imageTags.frontend // ""' "$file")
+              if ! old_backend=$(yq -r '.imageTags.backend // ""' "$file") ||
+                ! old_frontend=$(yq -r '.imageTags.frontend // ""' "$file"); then
+                echo "::error::cannot read ${file} in ${REGISTRY_REPO}; not rewriting it"
+                exit 1
+              fi
             fi
             backend=${BACKEND_TAG:-$old_backend}
             frontend=${FRONTEND_TAG:-$old_frontend}
