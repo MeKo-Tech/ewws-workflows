@@ -11,7 +11,7 @@ consumer repository calls it with a single `uses:` entry.
 | --- | --- | --- |
 | `test-pr-title.yml` | Conventional-Commits pull-request-title gate. | `types` |
 | `release-please.yml` | Cuts release pull requests and tags from Conventional Commits. Outputs `released` and `tag-name`. | `release-type`, `package-name`, `config-file`, `manifest-file` |
-| `build-and-push.yml` | Multi-arch (amd64 + arm64) Docker build, pushed to `ghcr.io`. | `image-name` (required), `dockerfile`, `context`, `platforms`, `push` |
+| `build-and-push.yml` | Multi-arch (amd64 + arm64) Docker build, pushed to `ghcr.io`. | `image-name` (required), `dockerfile`, `context`, `platforms`, `push`; optional secret `gh-pat` |
 | `go-lint.yml` | `golangci-lint` v2 for Go modules. | `go-version`, `golangci-lint-version`, `working-directory` |
 | `claude-code-review.yml` | One Claude review per non-draft pull request, triggered by a human or an `allowed-bots` App; comments only. Guidelines are read from the base branch, out of the pull request's reach. | `runner`, `timeout-minutes`, `guidelines`, `extra-instructions`, `ci-workflow`, `allowed-bots`, `model` |
 | `platform-check.yml` | App-platform guard rails: no committed `.env`, no binary SOPS files, no cluster/SOPS credentials in CI, no plaintext secrets (gitleaks). | `runner`, `extra-forbidden-refs`, `scan-history` |
@@ -70,6 +70,33 @@ jobs:
     with:
       image-name: ghcr.io/meko-tech/${{ github.event.repository.name }}
     secrets: inherit
+```
+
+A Dockerfile that fetches private Go modules (for example `ewws-auth`) gets a
+token through the optional `gh-pat` secret. It reaches BuildKit as secret
+`gh_pat`. Keep the token out of every file: `git config --global` would write it
+into `~/.gitconfig` of that layer, and `cache-to: mode=max` exports
+intermediate layers to the Actions cache. Pass the URL rewrite through
+command-scoped Git environment variables instead. When the caller passes no
+`gh-pat`, `/run/secrets/gh_pat` does not exist.
+
+```dockerfile
+RUN --mount=type=secret,id=gh_pat \
+	GIT_CONFIG_COUNT=1 \
+	GIT_CONFIG_KEY_0="url.https://x-access-token:$(cat /run/secrets/gh_pat)@github.com/.insteadOf" \
+	GIT_CONFIG_VALUE_0="https://github.com/" \
+	go mod download
+```
+
+```yaml
+jobs:
+  build-backend:
+    uses: MeKo-Tech/ewws-workflows/.github/workflows/build-and-push.yml@main
+    with:
+      image-name: ghcr.io/meko-tech/${{ github.event.repository.name }}-backend
+      dockerfile: ./backend/deployment/Dockerfile
+    secrets:
+      gh-pat: ${{ secrets.EWWS_GITHUB_TOKEN }}
 ```
 
 ### `claude-code-review.yml`
