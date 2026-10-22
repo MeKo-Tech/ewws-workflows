@@ -11,7 +11,8 @@ consumer repository calls it with a single `uses:` entry.
 | --- | --- | --- |
 | `test-pr-title.yml` | Conventional-Commits pull-request-title gate. | `types` |
 | `release-please.yml` | Cuts release pull requests and tags from Conventional Commits. Outputs `released` and `tag-name`. | `release-type`, `package-name`, `config-file`, `manifest-file` |
-| `build-and-push.yml` | Multi-arch (amd64 + arm64) Docker build, pushed to `ghcr.io`. | `image-name` (required), `dockerfile`, `context`, `platforms`, `push`; optional secret `gh-pat` |
+| `build-and-push.yml` | Multi-arch (amd64 + arm64) Docker build, pushed to `ghcr.io`. Outputs `sha-tag`. | `image-name` (required), `dockerfile`, `context`, `platforms`, `push`; optional secret `gh-pat` |
+| `write-registry-tag.yml` | Writes `tags/<slug>/<stage>.yaml` in `ewws-apps-registry` through a pull request it merges itself. Outputs `pr-url` and `merge-sha`. | `slug`, `stage` (required), `backend-tag`, `frontend-tag`, `registry-repo`, `app-id`, `merge-timeout-minutes` |
 | `go-lint.yml` | `golangci-lint` v2 for Go modules. | `go-version`, `golangci-lint-version`, `working-directory` |
 | `claude-code-review.yml` | One Claude review per non-draft pull request, triggered by a human or an `allowed-bots` App; comments only. Guidelines are read from the base branch, out of the pull request's reach. | `runner`, `timeout-minutes`, `guidelines`, `extra-instructions`, `ci-workflow`, `allowed-bots`, `model` |
 | `platform-check.yml` | App-platform guard rails: no committed `.env`, no binary SOPS files, no cluster/SOPS credentials in CI, no plaintext secrets (gitleaks). | `runner`, `extra-forbidden-refs`, `scan-history` |
@@ -98,6 +99,99 @@ jobs:
     secrets:
       gh-pat: ${{ secrets.EWWS_GITHUB_TOKEN }}
 ```
+
+`sha-tag` is the `sha-<7>` tag that was pushed (e.g. `sha-c69034c`); it is
+empty when nothing was pushed (`push: false` or a pull request).
+
+### `write-registry-tag.yml`
+
+Records which image an app runs on a stage: it writes
+`tags/<slug>/<stage>.yaml` in `MeKo-Tech/ewws-apps-registry`,
+
+```yaml
+imageTags:
+  backend: "sha-c758f9c"
+  frontend: "sha-c758f9c"
+```
+
+and nothing else. A component whose input is empty keeps the value it already
+has; an unchanged file is a successful no-op. The change goes through a pull
+request on a fresh `tags/<slug>-<stage>-<run>-<attempt>` branch, which the
+workflow squash-merges itself once the registry's required checks
+(`validate-apps`, `tag-scope`) are green. It retries the merge for
+`merge-timeout-minutes` (default 10) and fails the job when the checks fail or
+the time runs out. A pull request that conflicts with the registry's default
+branch is re-created from the latest one, once. Runs for the same slug and
+stage are serialised (`registry-tag-<slug>-<stage>`, within the caller
+repository).
+
+```yaml
+on:
+  push:
+    branches: [main]
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  backend:
+    uses: MeKo-Tech/ewws-workflows/.github/workflows/build-and-push.yml@v1
+    with:
+      image-name: ghcr.io/meko-tech/${{ github.event.repository.name }}-backend
+      context: backend
+    secrets: inherit
+
+  frontend:
+    uses: MeKo-Tech/ewws-workflows/.github/workflows/build-and-push.yml@v1
+    with:
+      image-name: ghcr.io/meko-tech/${{ github.event.repository.name }}-frontend
+      context: frontend
+    secrets: inherit
+
+  tag-staging:
+    needs: [backend, frontend]
+    if: github.ref == 'refs/heads/main'
+    uses: MeKo-Tech/ewws-workflows/.github/workflows/write-registry-tag.yml@v1
+    with:
+      slug: materialorder
+      stage: staging
+      backend-tag: ${{ needs.backend.outputs.sha-tag }}
+      frontend-tag: ${{ needs.frontend.outputs.sha-tag }}
+    secrets: inherit
+
+  tag-prod:
+    needs: [backend, frontend]
+    if: github.event_name == 'release'
+    uses: MeKo-Tech/ewws-workflows/.github/workflows/write-registry-tag.yml@v1
+    with:
+      slug: materialorder
+      stage: prod
+      backend-tag: ${{ needs.backend.outputs.sha-tag }}
+      frontend-tag: ${{ needs.frontend.outputs.sha-tag }}
+    secrets: inherit
+```
+
+A repository with only one component passes only that tag. The caller's
+`GITHUB_TOKEN` is used read-only; everything in the registry is done with a
+token of the GitHub App below, scoped to the registry repository alone.
+
+Prerequisites:
+
+- The GitHub App **`ewws-registry-tagger`**, installed on
+  `MeKo-Tech/ewws-apps-registry` only, with the repository permissions
+  *Contents: write*, *Pull requests: write*, *Checks: read* and
+  *Commit statuses: read*. It is a bypass actor (mode `pull_request`) for the
+  approval rule of the registry's default branch, but not for the ruleset that
+  requires `validate-apps` and `tag-scope`.
+- The org variable **`EWWS_REGISTRY_TAGGER_APP_ID`** (the App's ID; or pass
+  `app-id`) and the org secret **`EWWS_REGISTRY_TAGGER_PRIVATE_KEY`**, both
+  visible to the calling repository. `secrets: inherit` passes the secret; a
+  caller without `inherit` passes it as `registry-tagger-private-key`.
+- A claim `apps/<slug>.yaml` in the registry; the workflow refuses to tag an
+  unregistered app.
 
 ### `claude-code-review.yml`
 
