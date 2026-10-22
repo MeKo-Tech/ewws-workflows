@@ -56,7 +56,7 @@ jobs:
         with:
           # The pull request's commit range and the full history need more
           # than the merge commit.
-          fetch-depth: ${{ (inputs.scan-history || github.event_name == 'pull_request') && 0 || 1 }}
+          fetch-depth: ${{ (inputs.scan-history || github.event_name == 'pull_request') && '0' || '1' }}
           persist-credentials: false
 
       - name: No committed dotenv files
@@ -86,12 +86,16 @@ jobs:
           found=0
           # The binary format stores the whole file as one encrypted string
           # under a top-level "data" key next to the "sops" metadata block.
+          # Parse every candidate as JSON so the layout (compact, pretty,
+          # extra whitespace) does not matter.
           while IFS= read -r -d '' path; do
-            if git grep -q -F '"sops":' -- "$path"; then
+            if jq -e 'type == "object" and (.sops | type) == "object"
+                and (.data | type) == "string" and (.data | startswith("ENC["))' \
+              "$path" >/dev/null 2>&1; then
               echo "::error file=${path}::SOPS file in binary format — use a structured format (dotenv/yaml/json) or move the secret to the Key Vault"
               found=1
             fi
-          done < <(git grep -z -l -E '^[[:space:]]*"data":[[:space:]]*"ENC\[AES256_GCM,' || true)
+          done < <(git grep -z -l -F 'ENC[AES256_GCM,' || true)
           [[ "$found" -eq 0 ]] || exit 1
           echo "no binary SOPS files"
 
@@ -112,16 +116,26 @@ jobs:
           fi
           args=()
           for n in "${names[@]}"; do args+=(-e "$n"); done
-          hits="$(git grep -n -F -w "${args[@]}" -- .github || true)"
-          if [[ -n "$hits" ]]; then
-            while IFS= read -r hit; do
-              file="${hit%%:*}"
-              rest="${hit#*:}"
-              line="${rest%%:*}"
-              echo "::error file=${file},line=${line}::app CI must not use cluster or SOPS credentials — build and push the image, the platform deploys it"
-            done <<<"$hits"
-            exit 1
-          fi
+          found=0
+          while IFS= read -r hit; do
+            [[ -n "$hit" ]] || continue
+            file="${hit%%:*}"
+            rest="${hit#*:}"
+            line="${rest%%:*}"
+            text="${rest#*:}"
+            text="${text#"${text%%[![:space:]]*}"}"
+            text="${text%"${text##*[![:space:]]}"}"
+            text="${text#extra-forbidden-refs:}"
+            text="${text#"${text%%[![:space:]]*}"}"
+            # A line that is nothing but a name is this check's own
+            # `extra-forbidden-refs` list in the caller, not a usage.
+            skip=0
+            for n in "${names[@]}"; do [[ "$text" == "$n" ]] && skip=1; done
+            [[ "$skip" -eq 1 ]] && continue
+            echo "::error file=${file},line=${line}::app CI must not use cluster or SOPS credentials — build and push the image, the platform deploys it"
+            found=1
+          done < <(git grep -n -F -w "${args[@]}" -- .github || true)
+          [[ "$found" -eq 0 ]] || exit 1
           echo "no forbidden credentials referenced: ${names[*]}"
 
       - name: Install gitleaks
