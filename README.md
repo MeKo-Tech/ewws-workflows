@@ -14,6 +14,7 @@ consumer repository calls it with a single `uses:` entry.
 | `build-and-push.yml` | Multi-arch (amd64 + arm64) Docker build, pushed to `ghcr.io`. | `image-name` (required), `dockerfile`, `context`, `platforms`, `push` |
 | `go-lint.yml` | `golangci-lint` v2 for Go modules. | `go-version`, `golangci-lint-version`, `working-directory` |
 | `claude-code-review.yml` | One Claude review per non-draft pull request, triggered by a human or an `allowed-bots` App; comments only. Guidelines are read from the base branch, out of the pull request's reach. | `runner`, `timeout-minutes`, `guidelines`, `extra-instructions`, `ci-workflow`, `allowed-bots`, `model` |
+| `platform-check.yml` | App-platform guard rails: no committed `.env`, no binary SOPS files, no cluster/SOPS credentials in CI, no plaintext secrets (gitleaks). | `runner`, `extra-forbidden-refs`, `scan-history` |
 
 ## Calling them
 
@@ -121,3 +122,34 @@ A review session that ends without publishing anything fails the job instead of
 going green. On a private repository its transcript is kept for 14 days as the
 `claude-review-output-<pr>-<attempt>` artifact of the run; on a public one it
 is not uploaded, because the action hides that output for a reason.
+
+### `platform-check.yml`
+
+Guard rails for app repositories on the MeKo app platform. The job fails on
+
+- committed dotenv files (`.env`, `.env.local`, `prod.env`, …); allowed are
+  `*.example`, `*.sample`, `*.template`, `*.dist` and SOPS-encrypted `*.sops.env`,
+- SOPS files in the binary format (`"data": "ENC[…]"`),
+- references to `EWWS_ON_PREM_KUBECONFIG`, `AZURE_EWWS_KEY_VAULT_CLIENT_SECRET`
+  or `AZURE_EWWS_KEY_VAULT_CREDS` under `.github/` (plus `extra-forbidden-refs`),
+- plaintext secrets found by gitleaks (pinned, checksum-verified). It scans the
+  working tree and, on a pull request, every commit of the pull request;
+  `scan-history: true` scans the whole history instead. A `.gitleaks.toml` in
+  the repository root is honoured.
+
+All checks run even when an earlier one failed, so a single run lists every
+finding.
+
+```yaml
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  platform-check:
+    uses: MeKo-Tech/ewws-workflows/.github/workflows/platform-check.yml@main
+```
