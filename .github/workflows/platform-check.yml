@@ -1,0 +1,182 @@
+name: platform-check
+
+# Guard rails for app repositories on the MeKo app platform. Fails when the
+# repository carries something the platform forbids:
+#
+#   1. committed dotenv files (`.env`, `.env.local`, `prod.env`, …) — local
+#      values belong in an untracked `.env`; only `*.example`, `*.sample`,
+#      `*.template`, `*.dist` and SOPS-encrypted `*.sops.env` are allowed,
+#   2. SOPS files in the binary format (`"data": "ENC[…]"`), which hide what
+#      they contain from review and diff,
+#   3. CI references to cluster or SOPS credentials (`EWWS_ON_PREM_KUBECONFIG`,
+#      `AZURE_EWWS_KEY_VAULT_CLIENT_SECRET`, `AZURE_EWWS_KEY_VAULT_CREDS`)
+#      under `.github/` — app CI builds and pushes images, the platform
+#      deploys them,
+#   4. plaintext secrets, found by gitleaks (pinned below). The working tree
+#      is always scanned; on a pull request also every commit of the pull
+#      request, so a secret added and removed again inside it still fails.
+#      A `.gitleaks.toml` in the repository root is honoured.
+#
+# Every check runs even when an earlier one failed, so one run lists all
+# findings.
+
+on:
+  workflow_call:
+    inputs:
+      runner:
+        description: "Runner label for the job."
+        type: string
+        default: ubuntu-latest
+      extra-forbidden-refs:
+        description: "Additional names (one per line) that must not appear under `.github/`."
+        type: string
+        default: ""
+      scan-history:
+        description: "Let gitleaks scan the full Git history instead of the working tree and the pull request's commits."
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+env:
+  # gitleaks v8.30.1 — checksums from gitleaks_8.30.1_checksums.txt.
+  GITLEAKS_VERSION: 8.30.1
+  GITLEAKS_SHA256_X64: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+  GITLEAKS_SHA256_ARM64: e4a487ee7ccd7d3a7f7ec08657610aa3606637dab924210b3aee62570fb4b080
+
+jobs:
+  platform-check:
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 10
+    steps:
+      # actions/checkout@v7.0.1 — v4 runs on Node 20, which the runners now
+      # force onto Node 24 and warn about on every run.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          # The pull request's commit range and the full history need more
+          # than the merge commit.
+          fetch-depth: ${{ (inputs.scan-history || github.event_name == 'pull_request') && '0' || '1' }}
+          persist-credentials: false
+
+      - name: No committed dotenv files
+        run: |
+          set -euo pipefail
+          found=0
+          while IFS= read -r -d '' path; do
+            name="${path##*/}"
+            case "$name" in
+            *.example | *.sample | *.template | *.dist | *.sops.env) continue ;;
+            .env | .env.* | *.env) ;;
+            *) continue ;;
+            esac
+            echo "::error file=${path}::committed dotenv file — keep local values in an untracked .env, commit only .env.example; secrets belong in the Key Vault"
+            found=1
+          done < <(git ls-files -z)
+          if [[ "$found" -ne 0 ]]; then
+            echo "Remove the files with 'git rm --cached <file>' and rotate every secret they contained." >>"$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo "no dotenv files tracked"
+
+      - name: No binary SOPS files
+        if: ${{ !cancelled() }}
+        run: |
+          set -euo pipefail
+          found=0
+          # The binary format stores the whole file as one encrypted string
+          # under a top-level "data" key next to the "sops" metadata block.
+          # Parse every candidate as JSON so the layout (compact, pretty,
+          # extra whitespace) does not matter.
+          while IFS= read -r -d '' path; do
+            if jq -e 'type == "object" and (.sops | type) == "object"
+                and (.data | type) == "string" and (.data | startswith("ENC["))' \
+              "$path" >/dev/null 2>&1; then
+              echo "::error file=${path}::SOPS file in binary format — use a structured format (dotenv/yaml/json) or move the secret to the Key Vault"
+              found=1
+            fi
+          done < <(git grep -z -l -F 'ENC[AES256_GCM,' || true)
+          [[ "$found" -eq 0 ]] || exit 1
+          echo "no binary SOPS files"
+
+      - name: No cluster or SOPS credentials in CI
+        if: ${{ !cancelled() }}
+        env:
+          EXTRA: ${{ inputs.extra-forbidden-refs }}
+        run: |
+          set -euo pipefail
+          names=(EWWS_ON_PREM_KUBECONFIG AZURE_EWWS_KEY_VAULT_CLIENT_SECRET AZURE_EWWS_KEY_VAULT_CREDS)
+          while IFS= read -r extra; do
+            extra="${extra//[[:space:]]/}"
+            [[ -n "$extra" ]] && names+=("$extra")
+          done <<<"$EXTRA"
+          if [[ ! -d .github ]]; then
+            echo "no .github directory"
+            exit 0
+          fi
+          args=()
+          for n in "${names[@]}"; do args+=(-e "$n"); done
+          found=0
+          while IFS= read -r hit; do
+            [[ -n "$hit" ]] || continue
+            file="${hit%%:*}"
+            rest="${hit#*:}"
+            line="${rest%%:*}"
+            text="${rest#*:}"
+            text="${text#"${text%%[![:space:]]*}"}"
+            text="${text%"${text##*[![:space:]]}"}"
+            text="${text#extra-forbidden-refs:}"
+            text="${text#"${text%%[![:space:]]*}"}"
+            # A line that is nothing but a name is this check's own
+            # `extra-forbidden-refs` list in the caller, not a usage.
+            skip=0
+            for n in "${names[@]}"; do [[ "$text" == "$n" ]] && skip=1; done
+            [[ "$skip" -eq 1 ]] && continue
+            echo "::error file=${file},line=${line}::app CI must not use cluster or SOPS credentials — build and push the image, the platform deploys it"
+            found=1
+          done < <(git grep -n -F -w "${args[@]}" -- .github || true)
+          [[ "$found" -eq 0 ]] || exit 1
+          echo "no forbidden credentials referenced: ${names[*]}"
+
+      - name: Install gitleaks
+        if: ${{ !cancelled() }}
+        run: |
+          set -euo pipefail
+          case "$(uname -m)" in
+          x86_64) arch=x64 sum="$GITLEAKS_SHA256_X64" ;;
+          aarch64 | arm64) arch=arm64 sum="$GITLEAKS_SHA256_ARM64" ;;
+          *) echo "::error::unsupported architecture $(uname -m)" && exit 1 ;;
+          esac
+          tarball="gitleaks_${GITLEAKS_VERSION}_linux_${arch}.tar.gz"
+          dir="$RUNNER_TEMP/gitleaks"
+          mkdir -p "$dir"
+          curl -fsSL --retry 3 -o "$dir/$tarball" \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/${tarball}"
+          echo "${sum}  $dir/$tarball" | sha256sum -c -
+          tar -xzf "$dir/$tarball" -C "$dir" gitleaks
+          echo "$dir" >>"$GITHUB_PATH"
+          "$dir/gitleaks" version
+
+      - name: No plaintext secrets (gitleaks)
+        if: ${{ !cancelled() }}
+        env:
+          SCAN_HISTORY: ${{ inputs.scan-history }}
+          EVENT: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          rc=0
+          if [[ "$SCAN_HISTORY" == "true" ]]; then
+            gitleaks git . --no-banner --redact --exit-code 1 || rc=1
+          else
+            gitleaks dir . --no-banner --redact --exit-code 1 || rc=1
+            if [[ "$EVENT" == "pull_request" && -n "$BASE_SHA" && -n "$HEAD_SHA" ]]; then
+              gitleaks git . --no-banner --redact --exit-code 1 \
+                --log-opts="${BASE_SHA}..${HEAD_SHA}" || rc=1
+            fi
+          fi
+          if [[ "$rc" -ne 0 ]]; then
+            echo "::error::gitleaks found plaintext secrets — remove them, rotate them, and store them in the Key Vault"
+          fi
+          exit "$rc"
