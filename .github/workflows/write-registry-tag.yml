@@ -1,0 +1,314 @@
+name: write-registry-tag
+
+# Writes the image tags an app should run into the apps registry, so the
+# ApplicationSet rolls them out:
+#
+#   <registry-repo>/tags/<slug>/<stage>.yaml
+#
+#   imageTags:
+#     backend: "sha-c758f9c"
+#     frontend: "sha-c758f9c"
+#
+# The file is used verbatim as a Helm values file by the meko-app chart, so
+# `imageTags` is the chart value key. Nothing else in the registry is touched.
+#
+# Flow: GitHub App token (scoped to the registry repository only) → checkout →
+# rewrite the one tag file → commit on a fresh branch → pull request → wait for
+# the registry's required checks (`validate-apps`, `tag-scope`) → squash-merge
+# with `--admin`. The App bypasses only the approval rule; the status checks are
+# enforced by a ruleset without App bypass, so `--admin` fails until they pass.
+# The merge is retried until `merge-timeout-minutes` runs out, then the job fails.
+#
+# A component whose input is empty keeps the value it already has in the file.
+# An unchanged file is a successful no-op without a pull request.
+#
+# The caller's GITHUB_TOKEN is not used for anything beyond `contents: read`.
+
+on:
+  workflow_call:
+    inputs:
+      slug:
+        description: "App slug; `apps/<slug>.yaml` must exist in the registry."
+        type: string
+        required: true
+      stage:
+        description: "`staging` or `prod`."
+        type: string
+        required: true
+      backend-tag:
+        description: "Image tag for the backend, e.g. `sha-c758f9c`. Empty keeps the current value."
+        type: string
+        default: ""
+      frontend-tag:
+        description: "Image tag for the frontend. Empty keeps the current value."
+        type: string
+        default: ""
+      registry-repo:
+        description: "Registry repository (`owner/name`)."
+        type: string
+        default: MeKo-Tech/ewws-apps-registry
+      app-id:
+        description: "ID of the GitHub App `ewws-registry-tagger`. Defaults to the org variable `EWWS_REGISTRY_TAGGER_APP_ID`."
+        type: string
+        default: ${{ vars.EWWS_REGISTRY_TAGGER_APP_ID }}
+      merge-timeout-minutes:
+        description: "How long to wait for the registry checks before failing."
+        type: number
+        default: 10
+    secrets:
+      registry-tagger-private-key:
+        description: "Private key of the GitHub App. Optional with `secrets: inherit`, which passes the org secret `EWWS_REGISTRY_TAGGER_PRIVATE_KEY`."
+        required: false
+      EWWS_REGISTRY_TAGGER_PRIVATE_KEY:
+        description: "Org secret, picked up through `secrets: inherit` when `registry-tagger-private-key` is not passed."
+        required: false
+    outputs:
+      pr-url:
+        description: "URL of the registry pull request; empty when nothing changed."
+        value: ${{ jobs.write-tag.outputs.pr-url }}
+      merge-sha:
+        description: "Squash-merge commit in the registry; empty when nothing changed."
+        value: ${{ jobs.write-tag.outputs.merge-sha }}
+
+permissions:
+  contents: read
+
+jobs:
+  write-tag:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    concurrency:
+      group: registry-tag-${{ inputs.slug }}-${{ inputs.stage }}
+      cancel-in-progress: false
+    outputs:
+      pr-url: ${{ steps.publish.outputs.pr-url }}
+      merge-sha: ${{ steps.publish.outputs.merge-sha }}
+    steps:
+      - name: Validate inputs
+        id: validate
+        env:
+          SLUG: ${{ inputs.slug }}
+          STAGE: ${{ inputs.stage }}
+          BACKEND_TAG: ${{ inputs.backend-tag }}
+          FRONTEND_TAG: ${{ inputs.frontend-tag }}
+          REGISTRY_REPO: ${{ inputs.registry-repo }}
+          APP_ID: ${{ inputs.app-id }}
+          MERGE_TIMEOUT_MINUTES: ${{ inputs.merge-timeout-minutes }}
+          PRIVATE_KEY: ${{ secrets.registry-tagger-private-key || secrets.EWWS_REGISTRY_TAGGER_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          errors=0
+          fail() { echo "::error::$*"; errors=$((errors + 1)); }
+
+          # Same as the registry's app schema; the slug also becomes a path there.
+          [[ "$SLUG" =~ ^[a-z][a-z0-9-]{2,30}[a-z0-9]$ ]] || fail "slug '$SLUG' is not a valid app slug"
+          [[ "$STAGE" == staging || "$STAGE" == prod ]] || fail "stage must be 'staging' or 'prod', got '$STAGE'"
+          [[ -n "$BACKEND_TAG" || -n "$FRONTEND_TAG" ]] || fail "set at least one of backend-tag and frontend-tag"
+          # Same as the registry's imageTagValue: ^(?!latest$)[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$
+          for pair in "backend-tag=$BACKEND_TAG" "frontend-tag=$FRONTEND_TAG"; do
+            name=${pair%%=*} value=${pair#*=}
+            [[ -z "$value" ]] && continue
+            if [[ "$value" == latest || ! "$value" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$ ]]; then
+              fail "$name '$value' is not a valid image tag (no 'latest', [A-Za-z0-9_.-], max 128)"
+            fi
+          done
+          [[ "$REGISTRY_REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || fail "registry-repo must be 'owner/name', got '$REGISTRY_REPO'"
+          [[ "$MERGE_TIMEOUT_MINUTES" =~ ^[1-9][0-9]*$ ]] || fail "merge-timeout-minutes must be a positive integer, got '$MERGE_TIMEOUT_MINUTES'"
+          [[ -n "$APP_ID" ]] || fail "app-id is empty: set the org variable EWWS_REGISTRY_TAGGER_APP_ID or pass app-id"
+          if [[ -z "$PRIVATE_KEY" ]]; then
+            fail "no GitHub App private key: call this workflow with 'secrets: inherit' (org secret EWWS_REGISTRY_TAGGER_PRIVATE_KEY) or pass 'registry-tagger-private-key'"
+          fi
+          ((errors == 0)) || exit 1
+
+          # The App token is scoped to exactly this one repository.
+          {
+            echo "registry-owner=${REGISTRY_REPO%%/*}"
+            echo "registry-name=${REGISTRY_REPO#*/}"
+          } >>"$GITHUB_OUTPUT"
+
+      # actions/create-github-app-token@v3.3.0
+      - name: Create registry token
+        id: app-token
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510
+        with:
+          app-id: ${{ inputs.app-id }}
+          private-key: ${{ secrets.registry-tagger-private-key || secrets.EWWS_REGISTRY_TAGGER_PRIVATE_KEY }}
+          owner: ${{ steps.validate.outputs.registry-owner }}
+          repositories: ${{ steps.validate.outputs.registry-name }}
+          permission-contents: write
+          permission-pull-requests: write
+          permission-checks: read
+          permission-statuses: read
+
+      # actions/checkout@v7.0.1
+      - name: Check out registry
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: ${{ inputs.registry-repo }}
+          token: ${{ steps.app-token.outputs.token }}
+          path: registry
+
+      - name: Write tag file, open and merge pull request
+        id: publish
+        working-directory: registry
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          APP_SLUG: ${{ steps.app-token.outputs.app-slug }}
+          SLUG: ${{ inputs.slug }}
+          STAGE: ${{ inputs.stage }}
+          BACKEND_TAG: ${{ inputs.backend-tag }}
+          FRONTEND_TAG: ${{ inputs.frontend-tag }}
+          REGISTRY_REPO: ${{ inputs.registry-repo }}
+          MERGE_TIMEOUT_MINUTES: ${{ inputs.merge-timeout-minutes }}
+          POLL_SECONDS: "20"
+          SOURCE: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          BRANCH: tags/${{ inputs.slug }}-${{ inputs.stage }}-${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          # Without this, a failing git/gh call inside `$(open_pr ...)` would not stop the function.
+          shopt -s inherit_errexit
+
+          file="tags/${SLUG}/${STAGE}.yaml"
+          timeout_seconds=$((MERGE_TIMEOUT_MINUTES * 60))
+          base=$(git rev-parse --abbrev-ref HEAD)
+
+          # Commits are authored by the App's bot user.
+          bot_login="${APP_SLUG}[bot]"
+          bot_id=$(gh api "users/${bot_login}" --jq .id)
+          git config user.name "$bot_login"
+          git config user.email "${bot_id}+${bot_login}@users.noreply.github.com"
+
+          summary=""
+          [[ -n "$BACKEND_TAG" ]] && summary="backend=${BACKEND_TAG}"
+          [[ -n "$FRONTEND_TAG" ]] && summary="${summary:+$summary, }frontend=${FRONTEND_TAG}"
+          title="build(tags): ${SLUG} ${STAGE} -> ${summary}"
+
+          # Rewrites $file from the current checkout. Returns 1 when nothing changed.
+          write_tags() {
+            if [[ ! -f "apps/${SLUG}.yaml" ]]; then
+              echo "::error::apps/${SLUG}.yaml does not exist in ${REGISTRY_REPO}; register the app before tagging it"
+              exit 1
+            fi
+            local backend="" frontend="" old_backend="" old_frontend=""
+            # write_tags runs under `if`, which switches errexit off inside it: a
+            # failed read must abort explicitly, or the kept tag would be dropped.
+            if [[ -f "$file" ]]; then
+              if ! old_backend=$(yq -r '.imageTags.backend // ""' "$file") ||
+                ! old_frontend=$(yq -r '.imageTags.frontend // ""' "$file"); then
+                echo "::error::cannot read ${file} in ${REGISTRY_REPO}; not rewriting it"
+                exit 1
+              fi
+            fi
+            backend=${BACKEND_TAG:-$old_backend}
+            frontend=${FRONTEND_TAG:-$old_frontend}
+            # Compare values, not text, so a hand-formatted file is no reason for a PR.
+            if [[ -f "$file" && "$backend" == "$old_backend" && "$frontend" == "$old_frontend" ]]; then
+              return 1
+            fi
+            mkdir -p "tags/${SLUG}"
+            # Values are quoted so a tag like `1.2` stays a string for Helm.
+            # Validated against [A-Za-z0-9_.-], so plain double quotes are safe.
+            {
+              echo "imageTags:"
+              if [[ -n "$backend" ]]; then echo "  backend: \"${backend}\""; fi
+              if [[ -n "$frontend" ]]; then echo "  frontend: \"${frontend}\""; fi
+            } >"$file"
+            git add -- "$file"
+            ! git diff --cached --quiet
+          }
+
+          open_pr() {
+            local branch=$1
+            git checkout -q -B "$branch"
+            git commit -q -m "$title" -m "Source: ${SOURCE}"
+            git push -q origin "HEAD:refs/heads/${branch}"
+            printf '%s\n\n%s\n' \
+              "Written by the \`write-registry-tag\` workflow." \
+              "Source run: ${SOURCE}" >"$RUNNER_TEMP/pr-body.md"
+            gh pr create -R "$REGISTRY_REPO" --base "$base" --head "$branch" \
+              --title "$title" --body-file "$RUNNER_TEMP/pr-body.md"
+          }
+
+          # gh runs outside the checkout, so `--delete-branch` only deletes
+          # the remote branch instead of also switching the local one.
+          ghx() { (cd "$RUNNER_TEMP" && gh "$@"); }
+
+          if ! write_tags; then
+            echo "${file} already holds these tags; nothing to do."
+            exit 0
+          fi
+          branch=$BRANCH
+          pr_url=$(open_pr "$branch")
+          echo "Opened ${pr_url}"
+
+          recreated=false
+          deadline=$((SECONDS + timeout_seconds))
+          while :; do
+            info=$(ghx pr view "$pr_url" -R "$REGISTRY_REPO" \
+              --json state,mergeable,mergeStateStatus --jq '"\(.state) \(.mergeable) \(.mergeStateStatus)"')
+            read -r state mergeable merge_state <<<"$info"
+            echo "PR state=${state} mergeable=${mergeable} mergeStateStatus=${merge_state}"
+
+            if [[ "$state" == MERGED ]]; then
+              break
+            fi
+            if [[ "$state" == CLOSED ]]; then
+              echo "::error::${pr_url} was closed without being merged"
+              exit 1
+            fi
+
+            if [[ "$mergeable" == CONFLICTING ]]; then
+              if [[ "$recreated" == true ]]; then
+                echo "::error::${pr_url} conflicts with ${base} again after re-creating it; giving up"
+                exit 1
+              fi
+              # Someone else changed the same file. Start over from the latest base once.
+              echo "::warning::${pr_url} conflicts with ${base}; re-creating it from the latest ${base}"
+              ghx pr close "$pr_url" -R "$REGISTRY_REPO" --delete-branch \
+                --comment "Conflicts with ${base}; the tags are re-applied on top of the latest ${base}."
+              recreated=true
+              git fetch -q --depth=1 origin "$base"
+              git checkout -q -B "$base" FETCH_HEAD
+              if ! write_tags; then
+                echo "${base} already holds these tags; nothing to do."
+                pr_url=""
+                break
+              fi
+              branch="${BRANCH}-retry"
+              pr_url=$(open_pr "$branch")
+              echo "Opened ${pr_url}"
+              deadline=$((SECONDS + timeout_seconds))
+              continue
+            fi
+
+            if [[ "$merge_state" == BEHIND ]]; then
+              ghx api -X PUT "repos/${REGISTRY_REPO}/pulls/${pr_url##*/}/update-branch" --silent || true
+            fi
+
+            failed=$(ghx pr checks "$pr_url" -R "$REGISTRY_REPO" --required --json name,bucket \
+              --jq '[.[] | select(.bucket == "fail" or .bucket == "cancel") | .name] | join(", ")' 2>/dev/null || true)
+            if [[ -n "$failed" ]]; then
+              echo "::error::required checks failed on ${pr_url}: ${failed}"
+              exit 1
+            fi
+
+            if ghx pr merge "$pr_url" -R "$REGISTRY_REPO" --squash --admin --delete-branch; then
+              continue # confirm MERGED through the loop head
+            fi
+
+            if ((SECONDS >= deadline)); then
+              echo "::error::${pr_url} could not be merged within ${MERGE_TIMEOUT_MINUTES} min; the registry checks are still pending or the App is not a bypass actor"
+              exit 1
+            fi
+            sleep "$POLL_SECONDS"
+          done
+
+          merge_sha=""
+          if [[ -n "$pr_url" ]]; then
+            merge_sha=$(ghx pr view "$pr_url" -R "$REGISTRY_REPO" --json mergeCommit --jq '.mergeCommit.oid')
+            echo "Merged ${pr_url} as ${merge_sha}"
+          fi
+          {
+            echo "pr-url=${pr_url}"
+            echo "merge-sha=${merge_sha}"
+          } >>"$GITHUB_OUTPUT"
