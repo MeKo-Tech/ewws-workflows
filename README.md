@@ -73,11 +73,17 @@ jobs:
 
 A Dockerfile that fetches private Go modules (for example `ewws-auth`) gets a
 token through the optional `gh-pat` secret. It reaches BuildKit as secret
-`gh_pat` and never lands in a layer:
+`gh_pat`. Keep the token out of every file: `git config --global` would write it
+into `~/.gitconfig` of that layer, and `cache-to: mode=max` exports
+intermediate layers to the Actions cache. Pass the URL rewrite through
+command-scoped Git environment variables instead. When the caller passes no
+`gh-pat`, `/run/secrets/gh_pat` does not exist.
 
 ```dockerfile
 RUN --mount=type=secret,id=gh_pat \
-	git config --global url."https://x-access-token:$(cat /run/secrets/gh_pat)@github.com/".insteadOf "https://github.com/" && \
+	GIT_CONFIG_COUNT=1 \
+	GIT_CONFIG_KEY_0="url.https://x-access-token:$(cat /run/secrets/gh_pat)@github.com/.insteadOf" \
+	GIT_CONFIG_VALUE_0="https://github.com/" \
 	go mod download
 ```
 

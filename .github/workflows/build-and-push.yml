@@ -37,7 +37,7 @@ on:
         default: true
     secrets:
       gh-pat:
-        description: "Optional GitHub token, passed to BuildKit as secret `gh_pat` (mount it with `RUN --mount=type=secret,id=gh_pat`) to fetch private modules such as ewws-auth. Never written to a layer."
+        description: "Optional GitHub token, passed to BuildKit as secret `gh_pat` (mount it with `RUN --mount=type=secret,id=gh_pat`) to fetch private modules such as ewws-auth. Not mounted at all when omitted. The Dockerfile must not write the token to a file (e.g. `git config --global`); see README."
         required: false
 
 permissions:
@@ -86,7 +86,7 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
-          # Empty when the caller passes no `gh-pat`; a Dockerfile that
-          # mounts the secret then reads an empty file.
-          secrets: |
-            gh_pat=${{ secrets.gh-pat }}
+          # Only when the caller passes `gh-pat`: an empty `gh_pat=` makes the
+          # action warn and skip the secret anyway, so /run/secrets/gh_pat is
+          # then absent rather than empty.
+          secrets: ${{ secrets.gh-pat != '' && format('gh_pat={0}', secrets.gh-pat) || '' }}
