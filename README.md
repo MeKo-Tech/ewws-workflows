@@ -208,7 +208,7 @@ registry too), where the vibe-tenants ApplicationSet picks them up.
 **CI never seals and needs no Azure credentials.** Secret values live
 SOPS-encrypted in `secrets/<stage>.sops.yaml` (vibe key `sops-key-vibe` in
 `meko-vibe-vault`) and are sealed locally with `just secrets-seal`, which also
-stamps each SealedSecret with the annotation `meko.dev/sops-mac` — the
+stamps each SealedSecret with the annotation `platform.meko.dev/sops-mac` — the
 `sops.mac` of the source it was sealed from. Before copying anything the
 workflow checks, without decrypting:
 
@@ -219,7 +219,7 @@ workflow checks, without decrypting:
   `metadata.name` (`^[a-z][a-z0-9-]{1,40}[a-z0-9]$`), non-empty
   `encryptedData` and no `sealedsecrets.bitnami.com/cluster-wide` or
   `/namespace-wide` annotation (scope strict),
-- its `meko.dev/sops-mac` equals `sops.mac`. Otherwise the SOPS file changed
+- its `platform.meko.dev/sops-mac` equals `sops.mac`. Otherwise the SOPS file changed
   after sealing and the job fails with
   `secrets geändert, aber nicht neu versiegelt – just secrets-seal laufen lassen`.
 

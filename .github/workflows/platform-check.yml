@@ -143,6 +143,7 @@ jobs:
               err "$path" "${path}: no sops.azure_kv entry — ${rule}"
             fi
             while IFS=' ' read -r url key; do
+              url=${url%/}
               if [[ "$url" == *mekorp-vault* ]]; then
                 err "$path" "${path}: encrypted with ${url} — ${rule}"
               elif [[ "$url" != "$VIBE_VAULT" || "$key" != "$VIBE_KEY" ]]; then
