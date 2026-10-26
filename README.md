@@ -225,6 +225,9 @@ workflow checks, without decrypting:
 
 If the caller ships the template recipe `scripts/platform-secrets.sh`, its
 `check` (yq only, no decryption) runs first as well.
+A stage without `secrets/<stage>.sops.yaml` and without sealed files is
+skipped with a notice, so the job can be wired unconditionally. Removing the
+last secret of a stage from the registry is a human PR.
 
 The rest works like `write-registry-tag.yml`: same GitHub App, same
 prerequisites (including the claim `apps/<slug>.yaml`), a pull request
