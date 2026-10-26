@@ -219,10 +219,8 @@ claim's `repo.url`, by this workflow (`job_workflow_ref`), for this pull
 request's branch (run id), within 15 minutes before the pull request was
 opened, from an event/ref allowed for the stage. A commit someone else pushes
 onto the branch no longer matches the token. **The calling job must grant
-`id-token: write`** (job-level `permissions:` as in the example, or
-workflow-level); without it the workflow opens the pull request without a
-token, which the registry accepts with a warning only until the rollout is
-complete.
+`id-token: write`** (job-level `permissions:` as in the example, or workflow-level); without it the run fails
+to start, and the registry rejects a tagger pull request without a token.
 
 ### `write-registry-secrets.yml`
 
