@@ -121,9 +121,12 @@ request on a fresh `tags/<slug>-<stage>-<run>-<attempt>` branch, which the
 workflow squash-merges itself once the registry's required checks
 (`validate-apps`, `tag-scope`) are green. It retries the merge for
 `merge-timeout-minutes` (default 10) and fails the job when the checks fail or
-the time runs out. A pull request that conflicts with the registry's default
-branch is re-created from the latest one, once. Runs for the same slug and
-stage are serialised (`registry-tag-<slug>-<stage>`, within the caller
+the time runs out. A pull request that conflicts with or falls behind the
+registry's default branch is re-applied on top of it: force-pushed when the
+content stays the same (same pull request and token), else re-opened as a new
+pull request with a new token (`-r<n>` branch). Only commits the run pushed
+itself are merged (`--match-head-commit`). Runs for the same slug and stage
+are serialised (`registry-tag-<slug>-<stage>`, within the caller
 repository).
 
 ```yaml
@@ -155,6 +158,9 @@ jobs:
   tag-staging:
     needs: [backend, frontend]
     if: github.ref == 'refs/heads/main'
+    permissions:
+      contents: read
+      id-token: write # OIDC token for the registry's tag-scope check
     uses: MeKo-Tech/ewws-workflows/.github/workflows/write-registry-tag.yml@v1
     with:
       slug: materialorder
@@ -166,6 +172,9 @@ jobs:
   tag-prod:
     needs: [backend, frontend]
     if: github.event_name == 'release'
+    permissions:
+      contents: read
+      id-token: write # OIDC token for the registry's tag-scope check
     uses: MeKo-Tech/ewws-workflows/.github/workflows/write-registry-tag.yml@v1
     with:
       slug: materialorder
@@ -197,6 +206,23 @@ Prerequisites:
 The pull request body (and the commit body) carries a line
 `Source-Repository: <owner>/<repo>` next to `Source run: <run url>`; the
 registry's `tag-scope` check verifies it against the claim's `repo.url`.
+
+That line is only text: anyone who can run a workflow in an org repository can
+mint a tagger token and write any repository there. The proof is the line
+`OIDC-Token: <jwt>` in the pull request body — a GitHub Actions OIDC token
+requested right before the pull request is opened, with the audience
+`ewws-apps-registry:<tags|secrets>/<slug>/<stage>@<sha>`, where `<sha>` is the
+git object id of what the pull request writes (blob of the tag file, tree of
+the secrets directory). `tag-scope` verifies GitHub's signature, that the
+audience matches the pull request's head, and that the token was issued to the
+claim's `repo.url`, by this workflow (`job_workflow_ref`), for this pull
+request's branch (run id), within 15 minutes before the pull request was
+opened, from an event/ref allowed for the stage. A commit someone else pushes
+onto the branch no longer matches the token. **The calling job must grant
+`id-token: write`** (job-level `permissions:` as in the example, or
+workflow-level); without it the workflow opens the pull request without a
+token, which the registry accepts with a warning only until the rollout is
+complete.
 
 ### `write-registry-secrets.yml`
 
@@ -233,7 +259,7 @@ The rest works like `write-registry-tag.yml`: same GitHub App, same
 prerequisites (including the claim `apps/<slug>.yaml`), a pull request
 `build(secrets): <slug> <stage>` on a fresh
 `secrets/<slug>-<stage>-<run>-<attempt>` branch, squash-merged once
-`validate-apps` and `tag-scope` are green, re-created once on a conflict, runs
+`validate-apps` and `tag-scope` are green, re-applied on a conflict, runs
 serialised per slug and stage (`registry-secrets-<slug>-<stage>`). An unchanged
 directory is a successful no-op. The pull request body reads
 
@@ -242,11 +268,13 @@ Written by the `write-registry-secrets` workflow.
 
 Source-Repository: <owner>/<repo>
 Source run: https://github.com/<owner>/<repo>/actions/runs/<id>
+OIDC-Token: <jwt>
 ```
 
 `tag-scope` limits a tagger pull request to `tags/<slug>/` and
-`secrets/<slug>/` of a single slug and checks `Source-Repository` against the
-claim's `repo.url`.
+`secrets/<slug>/` of a single slug and checks `Source-Repository` and the OIDC
+token against the claim's `repo.url` (see above; the calling job needs
+`id-token: write`).
 
 | Input | Default | |
 | --- | --- | --- |
@@ -275,6 +303,9 @@ permissions:
 jobs:
   secrets-staging:
     if: github.event_name == 'push'
+    permissions:
+      contents: read
+      id-token: write # OIDC token for the registry's tag-scope check
     uses: MeKo-Tech/ewws-workflows/.github/workflows/write-registry-secrets.yml@main
     with:
       slug: materialorder
@@ -283,6 +314,9 @@ jobs:
 
   secrets-prod:
     if: github.event_name == 'release'
+    permissions:
+      contents: read
+      id-token: write # OIDC token for the registry's tag-scope check
     uses: MeKo-Tech/ewws-workflows/.github/workflows/write-registry-secrets.yml@main
     with:
       slug: materialorder
