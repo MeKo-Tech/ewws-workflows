@@ -162,6 +162,7 @@ jobs:
           MERGE_TIMEOUT_MINUTES: ${{ inputs.merge-timeout-minutes }}
           POLL_SECONDS: "20"
           SOURCE: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          SOURCE_REPOSITORY: ${{ github.repository }}
           BRANCH: tags/${{ inputs.slug }}-${{ inputs.stage }}-${{ github.run_id }}-${{ github.run_attempt }}
         run: |
           set -euo pipefail
@@ -220,10 +221,11 @@ jobs:
           open_pr() {
             local branch=$1
             git checkout -q -B "$branch"
-            git commit -q -m "$title" -m "Source: ${SOURCE}"
+            git commit -q -m "$title" -m "Source: ${SOURCE}" -m "Source-Repository: ${SOURCE_REPOSITORY}"
             git push -q origin "HEAD:refs/heads/${branch}"
-            printf '%s\n\n%s\n' \
+            printf '%s\n\n%s\n%s\n' \
               "Written by the \`write-registry-tag\` workflow." \
+              "Source-Repository: ${SOURCE_REPOSITORY}" \
               "Source run: ${SOURCE}" >"$RUNNER_TEMP/pr-body.md"
             gh pr create -R "$REGISTRY_REPO" --base "$base" --head "$branch" \
               --title "$title" --body-file "$RUNNER_TEMP/pr-body.md"
