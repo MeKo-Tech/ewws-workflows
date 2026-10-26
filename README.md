@@ -223,6 +223,9 @@ workflow checks, without decrypting:
   after sealing and the job fails with
   `secrets geändert, aber nicht neu versiegelt – just secrets-seal laufen lassen`.
 
+If the caller ships the template recipe `scripts/platform-secrets.sh`, its
+`check` (yq only, no decryption) runs first as well.
+
 The rest works like `write-registry-tag.yml`: same GitHub App, same
 prerequisites (including the claim `apps/<slug>.yaml`), a pull request
 `build(secrets): <slug> <stage>` on a fresh
