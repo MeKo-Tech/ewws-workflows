@@ -8,14 +8,23 @@ name: platform-check
 #      `*.template`, `*.dist` and SOPS-encrypted `*.sops.env` are allowed,
 #   2. SOPS files in the binary format (`"data": "ENC[…]"`), which hide what
 #      they contain from review and diff,
-#   3. CI references to cluster or SOPS credentials (`EWWS_ON_PREM_KUBECONFIG`,
+#   3. `*.sops.yaml` files not encrypted with exactly the vibe key
+#      (`sops.azure_kv[]` all on https://meko-vibe-vault.vault.azure.net, key
+#      `sops-key-vibe`; no `mekorp-vault*`, no pgp/age/kms/gcp_kms/hc_vault,
+#      no unencrypted value), and files under `deploy/sealed/` that are not
+#      bitnami.com/v1alpha1 SealedSecrets — read from metadata, nothing is
+#      decrypted. Secret values live SOPS-encrypted in
+#      `secrets/<stage>.sops.yaml` and are sealed locally with
+#      `just secrets-seal` into `deploy/sealed/<stage>/`,
+#   4. CI references to cluster or SOPS credentials (`EWWS_ON_PREM_KUBECONFIG`,
 #      `AZURE_EWWS_KEY_VAULT_CLIENT_SECRET`, `AZURE_EWWS_KEY_VAULT_CREDS`)
 #      under `.github/` — app CI builds and pushes images, the platform
 #      deploys them,
-#   4. plaintext secrets, found by gitleaks (pinned below). The working tree
+#   5. plaintext secrets, found by gitleaks (pinned below). The working tree
 #      is always scanned; on a pull request also every commit of the pull
 #      request, so a secret added and removed again inside it still fails.
-#      A `.gitleaks.toml` in the repository root is honoured.
+#      A `.gitleaks.toml` in the repository root is honoured. The files
+#      checked in 3. are scanned too; only their ciphertext lines are ignored.
 #
 # Every check runs even when an earlier one failed, so one run lists all
 # findings.
@@ -70,7 +79,7 @@ jobs:
             .env | .env.* | *.env) ;;
             *) continue ;;
             esac
-            echo "::error file=${path}::committed dotenv file — keep local values in an untracked .env, commit only .env.example; secrets belong in the Key Vault"
+            echo "::error file=${path}::committed dotenv file — keep local values in an untracked .env, commit only .env.example; secret values belong SOPS-encrypted in secrets/<stage>.sops.yaml (vibe key sops-key-vibe in meko-vibe-vault), sealed with just secrets-seal into deploy/sealed/<stage>/"
             found=1
           done < <(git ls-files -z)
           if [[ "$found" -ne 0 ]]; then
@@ -92,12 +101,95 @@ jobs:
             if jq -e 'type == "object" and (.sops | type) == "object"
                 and (.data | type) == "string" and (.data | startswith("ENC["))' \
               "$path" >/dev/null 2>&1; then
-              echo "::error file=${path}::SOPS file in binary format — use a structured format (dotenv/yaml/json) or move the secret to the Key Vault"
+              echo "::error file=${path}::SOPS file in binary format — keep secret values SOPS-encrypted as YAML in secrets/<stage>.sops.yaml (vibe key sops-key-vibe in meko-vibe-vault) and seal them with just secrets-seal into deploy/sealed/<stage>/"
               found=1
             fi
           done < <(git grep -z -l -F 'ENC[AES256_GCM,' || true)
           [[ "$found" -eq 0 ]] || exit 1
           echo "no binary SOPS files"
+
+      # Reads SOPS metadata and SealedSecret headers only; nothing is decrypted.
+      # The gitleaks step below ignores only ciphertext lines of these files.
+      - name: SOPS files use the vibe key, sealed files are SealedSecrets
+        if: ${{ !cancelled() }}
+        env:
+          VIBE_VAULT: https://meko-vibe-vault.vault.azure.net
+          VIBE_KEY: sops-key-vibe
+        run: |
+          set -euo pipefail
+          if ! command -v yq >/dev/null; then
+            echo "::error::yq (mikefarah/yq v4) is not installed on this runner"
+            exit 1
+          fi
+          found=0
+          err() {
+            echo "::error file=$1::$2"
+            found=1
+          }
+          rule="vibe apps may only use meko-vibe-vault/${VIBE_KEY} (${VIBE_VAULT}), never mekorp-vault*"
+
+          sops_files=0
+          while IFS= read -r -d '' path; do
+            sops_files=$((sops_files + 1))
+            if ! tag=$(yq -r '.sops | tag' "$path" 2>/dev/null); then
+              err "$path" "${path}: not valid YAML"
+              continue
+            fi
+            if [[ "$tag" != '!!map' ]]; then
+              err "$path" "${path}: no sops metadata — a *.sops.yaml file must be SOPS-encrypted (${rule})"
+              continue
+            fi
+            if [[ "$(yq -r '.sops.azure_kv // [] | length' "$path")" == 0 ]]; then
+              err "$path" "${path}: no sops.azure_kv entry — ${rule}"
+            fi
+            while IFS=' ' read -r url key; do
+              url=${url%/}
+              if [[ "$url" == *mekorp-vault* ]]; then
+                err "$path" "${path}: encrypted with ${url} — ${rule}"
+              elif [[ "$url" != "$VIBE_VAULT" || "$key" != "$VIBE_KEY" ]]; then
+                err "$path" "${path}: encrypted with ${url:-<no vault_url>} key ${key:-<no name>} — ${rule}"
+              fi
+            done < <(yq -r '.sops.azure_kv // [] | .[] | (.vault_url // "") + " " + (.name // "")' "$path")
+            others=$(yq -r '.sops | to_entries
+              | map(select((.key == "pgp" or .key == "age" or .key == "kms" or .key == "gcp_kms" or .key == "hc_vault")
+                and (.value | length) > 0))
+              | map(.key) | join(", ")' "$path")
+            if [[ -n "$others" ]]; then
+              err "$path" "${path}: also encrypted with ${others} — ${rule}"
+            fi
+            # Key paths only, never values.
+            plain=$(yq -r '[del(.sops) | .. | select(tag != "!!map" and tag != "!!seq")
+              | select(tag != "!!str" or (test("^ENC\[AES256_GCM,") | not))
+              | path | join(".")] | join(", ")' "$path")
+            if [[ -n "$plain" ]]; then
+              err "$path" "${path}: unencrypted values at ${plain} — encrypt the whole file with sops"
+            fi
+          done < <(git ls-files -z -- '*.sops.yaml')
+
+          sealed_files=0
+          while IFS= read -r -d '' path; do
+            sealed_files=$((sealed_files + 1))
+            if ! docs=$(yq ea '[.] | length' "$path" 2>/dev/null); then
+              err "$path" "${path}: not valid YAML"
+              continue
+            fi
+            if [[ "$docs" != 1 ]]; then
+              err "$path" "${path}: deploy/sealed/ holds one SealedSecret per file, found ${docs} documents"
+              continue
+            fi
+            kind=$(yq -r '.kind // ""' "$path")
+            api=$(yq -r '.apiVersion // ""' "$path")
+            if [[ "$kind" != SealedSecret || "$api" != bitnami.com/v1alpha1 ]]; then
+              err "$path" "${path}: deploy/sealed/ holds only bitnami.com/v1alpha1 SealedSecrets, got ${api:-?}/${kind:-?} — seal with just secrets-seal"
+            fi
+            # spec.template.data is copied into the Secret unencrypted.
+            if [[ "$(yq -r '.spec.template.data // {} | length' "$path")" != 0 ]]; then
+              err "$path" "${path}: spec.template.data is not encrypted — put every value into secrets/<stage>.sops.yaml and seal it"
+            fi
+          done < <(git ls-files -z -- 'deploy/sealed/*.yaml')
+
+          [[ "$found" -eq 0 ]] || exit 1
+          echo "${sops_files} SOPS file(s) on ${VIBE_VAULT}/${VIBE_KEY}, ${sealed_files} SealedSecret(s)"
 
       - name: No cluster or SOPS credentials in CI
         if: ${{ !cancelled() }}
@@ -166,17 +258,38 @@ jobs:
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           set -euo pipefail
+          # Ciphertext in SOPS files and SealedSecrets looks like secrets to
+          # gitleaks. Allow only ciphertext-shaped lines (ENC[AES256_GCM,...], sops
+          # enc:, SealedSecret Ag... values) - comments, annotations and history in
+          # those files are still scanned. An own
+          # .gitleaks.toml stays in force through `extend`.
+          cfg="$RUNNER_TEMP/gitleaks.toml"
+          if [[ -f .gitleaks.toml ]]; then
+            printf '[extend]\npath = "%s"\n\n' "$PWD/.gitleaks.toml" >"$cfg"
+          else
+            printf '[extend]\nuseDefault = true\n\n' >"$cfg"
+          fi
+          cat >>"$cfg" <<'EOF'
+          [[allowlists]]
+          description = "SOPS and SealedSecret ciphertext lines only (checked by platform-check)"
+          regexTarget = "line"
+          regexes = [
+            '''^\s*[^\s:#][^:#]*:\s+ENC\[AES256_GCM,data:[A-Za-z0-9+/=]*,iv:[A-Za-z0-9+/=]+,tag:[A-Za-z0-9+/=]+,type:[a-z]+\]\s*$''',
+            '''^\s*enc:\s+[A-Za-z0-9+/=_-]+\s*$''',
+            '''^\s+[A-Za-z_][A-Za-z0-9_.-]*:\s+Ag[A-Za-z0-9+/=]{100,}\s*$''',
+          ]
+          EOF
           rc=0
           if [[ "$SCAN_HISTORY" == "true" ]]; then
-            gitleaks git . --no-banner --redact --exit-code 1 || rc=1
+            gitleaks git . --config "$cfg" --no-banner --redact --exit-code 1 || rc=1
           else
-            gitleaks dir . --no-banner --redact --exit-code 1 || rc=1
+            gitleaks dir . --config "$cfg" --no-banner --redact --exit-code 1 || rc=1
             if [[ "$EVENT" == "pull_request" && -n "$BASE_SHA" && -n "$HEAD_SHA" ]]; then
-              gitleaks git . --no-banner --redact --exit-code 1 \
+              gitleaks git . --config "$cfg" --no-banner --redact --exit-code 1 \
                 --log-opts="${BASE_SHA}..${HEAD_SHA}" || rc=1
             fi
           fi
           if [[ "$rc" -ne 0 ]]; then
-            echo "::error::gitleaks found plaintext secrets — remove them, rotate them, and store them in the Key Vault"
+            echo "::error::gitleaks found plaintext secrets — remove them, rotate them, and keep them SOPS-encrypted in secrets/<stage>.sops.yaml (vibe key sops-key-vibe in meko-vibe-vault), sealed with just secrets-seal into deploy/sealed/<stage>/"
           fi
           exit "$rc"

@@ -13,9 +13,10 @@ consumer repository calls it with a single `uses:` entry.
 | `release-please.yml` | Cuts release pull requests and tags from Conventional Commits. Outputs `released` and `tag-name`. | `release-type`, `package-name`, `config-file`, `manifest-file` |
 | `build-and-push.yml` | Multi-arch (amd64 + arm64) Docker build, pushed to `ghcr.io`. Outputs `sha-tag`. | `image-name` (required), `dockerfile`, `context`, `platforms`, `push`; optional secret `gh-pat` |
 | `write-registry-tag.yml` | Writes `tags/<slug>/<stage>.yaml` in `ewws-apps-registry` through a pull request it merges itself. Outputs `pr-url` and `merge-sha`. | `slug`, `stage` (required), `backend-tag`, `frontend-tag`, `registry-repo`, `app-id`, `merge-timeout-minutes` |
+| `write-registry-secrets.yml` | Checks the caller's SealedSecrets against `sops.mac` of the SOPS source and copies them to `secrets/<slug>/<stage>/` in `ewws-apps-registry` through a pull request it merges itself. Never seals, no Azure credentials. Outputs `pr-url` and `merge-sha`. | `slug`, `stage` (required), `sealed-dir`, `sops-file`, `registry-repo`, `app-id`, `merge-timeout-minutes` |
 | `go-lint.yml` | `golangci-lint` v2 for Go modules. | `go-version`, `golangci-lint-version`, `working-directory` |
 | `claude-code-review.yml` | One Claude review per non-draft pull request, triggered by a human or an `allowed-bots` App; comments only. Guidelines are read from the base branch, out of the pull request's reach. | `runner`, `timeout-minutes`, `guidelines`, `extra-instructions`, `ci-workflow`, `allowed-bots`, `model` |
-| `platform-check.yml` | App-platform guard rails: no committed `.env`, no binary SOPS files, no cluster/SOPS credentials in CI, no plaintext secrets (gitleaks). | `runner`, `extra-forbidden-refs`, `scan-history` |
+| `platform-check.yml` | App-platform guard rails: no committed `.env`, no binary SOPS files, `*.sops.yaml` only on the vibe key, only SealedSecrets under `deploy/sealed/`, no cluster/SOPS credentials in CI, no plaintext secrets (gitleaks). | `runner`, `extra-forbidden-refs`, `scan-history` |
 
 ## Calling them
 
@@ -193,6 +194,105 @@ Prerequisites:
 - A claim `apps/<slug>.yaml` in the registry; the workflow refuses to tag an
   unregistered app.
 
+The pull request body (and the commit body) carries a line
+`Source-Repository: <owner>/<repo>` next to `Source run: <run url>`; the
+registry's `tag-scope` check verifies it against the claim's `repo.url`.
+
+### `write-registry-secrets.yml`
+
+Publishes an app's SealedSecrets for one stage: it replaces
+`secrets/<slug>/<stage>/` in `MeKo-Tech/ewws-apps-registry` with the files of
+the caller's `deploy/sealed/<stage>/` (files gone there are deleted in the
+registry too), where the vibe-tenants ApplicationSet picks them up.
+
+**CI never seals and needs no Azure credentials.** Secret values live
+SOPS-encrypted in `secrets/<stage>.sops.yaml` (vibe key `sops-key-vibe` in
+`meko-vibe-vault`) and are sealed locally with `just secrets-seal`, which also
+stamps each SealedSecret with the annotation `platform.meko.dev/sops-mac` — the
+`sops.mac` of the source it was sealed from. Before copying anything the
+workflow checks, without decrypting:
+
+- `secrets/<stage>.sops.yaml` exists and has a `sops.mac`; `deploy/sealed/<stage>/`
+  holds at least one file and only `<name>.yaml` files,
+- every file is one `bitnami.com/v1alpha1` `SealedSecret` with
+  `metadata.namespace: tenant-<slug>-<stage>`, a file name equal to
+  `metadata.name` (`^[a-z][a-z0-9-]{1,40}[a-z0-9]$`), non-empty
+  `encryptedData` and no `sealedsecrets.bitnami.com/cluster-wide` or
+  `/namespace-wide` annotation (scope strict),
+- its `platform.meko.dev/sops-mac` equals `sops.mac`. Otherwise the SOPS file changed
+  after sealing and the job fails with
+  `secrets geändert, aber nicht neu versiegelt – just secrets-seal laufen lassen`.
+
+If the caller ships the template recipe `scripts/platform-secrets.sh`, its
+`check` (yq only, no decryption) runs first as well.
+A stage without `secrets/<stage>.sops.yaml` and without sealed files is
+skipped with a notice, so the job can be wired unconditionally. Removing the
+last secret of a stage from the registry is a human PR.
+
+The rest works like `write-registry-tag.yml`: same GitHub App, same
+prerequisites (including the claim `apps/<slug>.yaml`), a pull request
+`build(secrets): <slug> <stage>` on a fresh
+`secrets/<slug>-<stage>-<run>-<attempt>` branch, squash-merged once
+`validate-apps` and `tag-scope` are green, re-created once on a conflict, runs
+serialised per slug and stage (`registry-secrets-<slug>-<stage>`). An unchanged
+directory is a successful no-op. The pull request body reads
+
+```text
+Written by the `write-registry-secrets` workflow.
+
+Source-Repository: <owner>/<repo>
+Source run: https://github.com/<owner>/<repo>/actions/runs/<id>
+```
+
+`tag-scope` limits a tagger pull request to `tags/<slug>/` and
+`secrets/<slug>/` of a single slug and checks `Source-Repository` against the
+claim's `repo.url`.
+
+| Input | Default | |
+| --- | --- | --- |
+| `slug` | — (required) | App slug. |
+| `stage` | — (required) | `staging` or `prod`. |
+| `sealed-dir` | `deploy/sealed/<stage>` | SealedSecrets in the caller repository. |
+| `sops-file` | `secrets/<stage>.sops.yaml` | SOPS source they were sealed from. |
+| `registry-repo` | `MeKo-Tech/ewws-apps-registry` | |
+| `app-id` | `vars.EWWS_REGISTRY_TAGGER_APP_ID` | |
+| `merge-timeout-minutes` | `10` | |
+
+Staging is published on a push to `main`, prod on a release — only when the
+sealed files changed:
+
+```yaml
+on:
+  push:
+    branches: [main]
+    paths: ["deploy/sealed/**"]
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+  secrets-staging:
+    if: github.event_name == 'push'
+    uses: MeKo-Tech/ewws-workflows/.github/workflows/write-registry-secrets.yml@main
+    with:
+      slug: materialorder
+      stage: staging
+    secrets: inherit
+
+  secrets-prod:
+    if: github.event_name == 'release'
+    uses: MeKo-Tech/ewws-workflows/.github/workflows/write-registry-secrets.yml@main
+    with:
+      slug: materialorder
+      stage: prod
+    secrets: inherit
+```
+
+A release always runs the prod job; with unchanged files it ends as a no-op
+without a pull request. `paths` cannot filter a `release` event.
+
 ### `claude-code-review.yml`
 
 ```yaml
@@ -251,12 +351,27 @@ Guard rails for app repositories on the MeKo app platform. The job fails on
 - committed dotenv files (`.env`, `.env.local`, `prod.env`, …); allowed are
   `*.example`, `*.sample`, `*.template`, `*.dist` and SOPS-encrypted `*.sops.env`,
 - SOPS files in the binary format (`"data": "ENC[…]"`),
+- committed `*.sops.yaml` files not encrypted with exactly the vibe key: every
+  `sops.azure_kv[]` entry must be `https://meko-vibe-vault.vault.azure.net`
+  with key `sops-key-vibe`. A `mekorp-vault*` URL, a file without any
+  `azure_kv` entry, any `pgp`/`age`/`kms`/`gcp_kms`/`hc_vault` key or an
+  unencrypted value fails — vibe apps may only use
+  `meko-vibe-vault/sops-key-vibe`, never `mekorp-vault*`. Only metadata is
+  read; nothing is decrypted,
+- files under `deploy/sealed/` that are not one `bitnami.com/v1alpha1`
+  `SealedSecret` each, or that carry an unencrypted `spec.template.data`,
 - references to `EWWS_ON_PREM_KUBECONFIG`, `AZURE_EWWS_KEY_VAULT_CLIENT_SECRET`
   or `AZURE_EWWS_KEY_VAULT_CREDS` under `.github/` (plus `extra-forbidden-refs`),
 - plaintext secrets found by gitleaks (pinned, checksum-verified). It scans the
   working tree and, on a pull request, every commit of the pull request;
   `scan-history: true` scans the whole history instead. A `.gitleaks.toml` in
-  the repository root is honoured.
+  the repository root is honoured. In `*.sops.yaml` files and
+  SealedSecrets only ciphertext-shaped lines are ignored (`ENC[AES256_GCM,…]`,
+  sops `enc:`, `Ag…` values); comments, annotations and history are scanned.
+
+Secret values belong SOPS-encrypted in `secrets/<stage>.sops.yaml` and sealed
+with `just secrets-seal` into `deploy/sealed/<stage>/`; see
+`write-registry-secrets.yml`.
 
 All checks run even when an earlier one failed, so a single run lists every
 finding.
