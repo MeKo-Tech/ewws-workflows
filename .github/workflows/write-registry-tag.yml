@@ -89,11 +89,12 @@ on:
         description: "Squash-merge commit in the registry; empty when nothing changed."
         value: ${{ jobs.write-tag.outputs.merge-sha }}
 
-# No `permissions:` here during the OIDC rollout: the job inherits the
-# calling job's, so it gets `id-token: write` where the caller grants it and
-# still starts where it does not (declaring it here would fail every caller
-# that has not granted it yet). Once every caller grants it, this becomes
-# `contents: read` + `id-token: write` again.
+# `id-token: write` requests the OIDC token for the registry PR. A reusable
+# workflow cannot raise permissions: the calling job must grant it too, or
+# the run fails to start.
+permissions:
+  contents: read
+  id-token: write
 
 jobs:
   write-tag:
@@ -266,13 +267,12 @@ jobs:
           # run, and the audience binds it to exactly this content, so it
           # proves which app's CI wrote what; the `Source-Repository:` line is
           # only text for humans. Needs `id-token: write` on the calling job.
-          # Sets $oidc (empty without the permission, accepted by the registry
-          # during the rollout).
+          # Sets $oidc.
           request_oidc_token() {
             oidc=""
             if [[ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" || -z "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" ]]; then
-              echo "::warning::no OIDC token: grant 'permissions: id-token: write' to the job that calls this workflow; the registry will soon require it"
-              return 0
+              echo "::error::no OIDC token: grant 'permissions: id-token: write' to the job that calls this workflow; the registry requires it"
+              exit 1
             fi
             oidc=$(curl -fsS --retry 3 --max-time 30 -G \
               -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
