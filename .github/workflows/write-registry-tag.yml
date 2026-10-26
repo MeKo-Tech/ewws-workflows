@@ -25,7 +25,8 @@ name: write-registry-tag
 # The caller's GITHUB_TOKEN is not used for anything beyond `contents: read`.
 #
 # OIDC: the pull request body also carries `OIDC-Token: <jwt>`, a GitHub
-# Actions OIDC token with audience `ewws-apps-registry`, requested right before
+# Actions OIDC token with audience
+# `ewws-apps-registry:<kind>/<slug>/<stage>@<git sha of what it writes>`, requested right before
 # the pull request is opened. The registry's `tag-scope` check verifies it
 # (GitHub's signature; repository = the claim's `repo.url`; issued by this
 # workflow; event/ref allowed for the stage; one pull request per token), so
@@ -39,7 +40,8 @@ name: write-registry-tag
 # Only commits this run pushed are merged (`--match-head-commit`): the token
 # in the body would otherwise vouch for a commit someone else pushed to the
 # branch. A conflicting or outdated branch is re-applied on top of the latest
-# base and force-pushed, keeping the pull request and its token.
+# base: force-pushed when the content stays the same (same pull request and
+# token), else re-opened as a new pull request with a new token.
 
 on:
   workflow_call:
@@ -184,6 +186,7 @@ jobs:
           SOURCE: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           SOURCE_REPOSITORY: ${{ github.repository }}
           OIDC_AUDIENCE: ewws-apps-registry
+          KIND: tags
           BRANCH: tags/${{ inputs.slug }}-${{ inputs.stage }}-${{ github.run_id }}-${{ github.run_attempt }}
         run: |
           set -euo pipefail
@@ -239,32 +242,42 @@ jobs:
             ! git diff --cached --quiet
           }
 
-          # Commits the staged change and force-pushes it to $branch, which
-          # belongs to this run alone. $pushed is the commit the PR must
-          # carry when it is merged; $ours lists every commit pushed so far.
-          push_branch() {
+          # Commits the staged change on $branch. $content is the git object id
+          # of what the PR writes (blob of the tag file / tree of the secrets
+          # directory), which the OIDC token's audience names.
+          commit_change() {
             git checkout -q -B "$branch"
             git commit -q -m "$title" -m "Source: ${SOURCE}" -m "Source-Repository: ${SOURCE_REPOSITORY}"
+            content=$(git rev-parse "HEAD:${target_path}")
+          }
+
+          # Force-pushes HEAD to $branch, which belongs to this run alone.
+          # $pushed is the commit the PR must carry when it is merged; $ours
+          # lists every commit pushed so far.
+          push_branch() {
             git push -q --force origin "HEAD:refs/heads/${branch}"
             pushed=$(git rev-parse HEAD)
             ours="${ours} ${pushed}"
           }
 
-          # GitHub Actions OIDC token for the registry's `tag-scope` check.
+          # GitHub Actions OIDC token for the registry's `tag-scope` check,
+          # audience `ewws-apps-registry:<kind>/<slug>/<stage>@<content>`.
           # GitHub signs it and names the repository, event and ref of this
-          # run, so it proves which app's CI opened the PR; the
-          # `Source-Repository:` line is only text for humans. Needs
-          # `id-token: write` on the calling job. Sets $oidc (empty without
-          # the permission, accepted by the registry during the rollout).
+          # run, and the audience binds it to exactly this content, so it
+          # proves which app's CI wrote what; the `Source-Repository:` line is
+          # only text for humans. Needs `id-token: write` on the calling job.
+          # Sets $oidc (empty without the permission, accepted by the registry
+          # during the rollout).
           request_oidc_token() {
             oidc=""
             if [[ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" || -z "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" ]]; then
               echo "::warning::no OIDC token: grant 'permissions: id-token: write' to the job that calls this workflow; the registry will soon require it"
               return 0
             fi
-            oidc=$(curl -fsS --retry 3 --max-time 30 \
+            oidc=$(curl -fsS --retry 3 --max-time 30 -G \
               -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
-              "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${OIDC_AUDIENCE}" | jq -r '.value // ""')
+              --data-urlencode "audience=${OIDC_AUDIENCE}:${KIND}/${SLUG}/${STAGE}@${content}" \
+              "${ACTIONS_ID_TOKEN_REQUEST_URL}" | jq -r '.value // ""')
             if [[ -z "$oidc" ]]; then
               echo "::error::the OIDC token request returned no token"
               exit 1
@@ -272,8 +285,8 @@ jobs:
             echo "::add-mask::${oidc}"
           }
 
-          open_pr() {
-            push_branch
+          # Opens the PR for the pushed $branch with a fresh token.
+          publish_pr() {
             request_oidc_token
             {
               printf '%s\n\n' "Written by the \`write-registry-tag\` workflow."
@@ -282,6 +295,7 @@ jobs:
             } >"$RUNNER_TEMP/pr-body.md"
             pr_url=$(gh pr create -R "$REGISTRY_REPO" --base "$base" --head "$branch" \
               --title "$title" --body-file "$RUNNER_TEMP/pr-body.md")
+            pr_content=$content
           }
 
           # gh runs outside the checkout, so `--delete-branch` only deletes
@@ -292,9 +306,12 @@ jobs:
             echo "${file} already holds these tags; nothing to do."
             exit 0
           fi
+          target_path=$file
           branch=$BRANCH
           ours=""
-          open_pr
+          commit_change
+          push_branch
+          publish_pr
           echo "Opened ${pr_url}"
 
           refreshes=0
@@ -313,9 +330,9 @@ jobs:
               exit 1
             fi
 
-            # Anyone holding a tagger token can push to this branch, and the
-            # OIDC token in the body would vouch for that commit too. Only
-            # what this run pushed is merged (also --match-head-commit below).
+            # Anyone holding a tagger token can push to this branch. The
+            # registry rejects content the token does not name; this run also
+            # refuses to merge anything it did not push itself.
             if [[ " ${ours} " != *" ${head} "* ]]; then
               echo "::error::${pr_url} has head ${head}, which this run did not push; someone else pushed to ${branch}. Not merging."
               ghx pr close "$pr_url" -R "$REGISTRY_REPO" --delete-branch \
@@ -337,7 +354,9 @@ jobs:
                 exit 1
               fi
               # Someone else changed the registry. Re-apply the tags on top of
-              # the latest base and force-push; same PR, same OIDC token.
+              # the latest base. Same content: force-push, same PR and token.
+              # Different content (the other component's tag changed): the
+              # token no longer fits, so a new PR with a new token.
               refreshes=$((refreshes + 1))
               echo "${pr_url} is ${mergeable}/${merge_state}; re-applying the tags on top of the latest ${base}"
               git fetch -q --depth=1 origin "$base"
@@ -349,7 +368,18 @@ jobs:
                 pr_url=""
                 break
               fi
-              push_branch
+              commit_change
+              if [[ "$content" == "$pr_content" ]]; then
+                push_branch
+              else
+                ghx pr close "$pr_url" -R "$REGISTRY_REPO" --delete-branch \
+                  --comment "${base} changed what this PR writes; re-opened on top of it with a new OIDC token."
+                branch="${BRANCH}-r${refreshes}"
+                git checkout -q -B "$branch"
+                push_branch
+                publish_pr
+                echo "Re-opened as ${pr_url}"
+              fi
               deadline=$((SECONDS + timeout_seconds))
               continue
             fi

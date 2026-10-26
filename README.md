@@ -122,10 +122,11 @@ workflow squash-merges itself once the registry's required checks
 (`validate-apps`, `tag-scope`) are green. It retries the merge for
 `merge-timeout-minutes` (default 10) and fails the job when the checks fail or
 the time runs out. A pull request that conflicts with or falls behind the
-registry's default branch is re-applied on top of it and force-pushed (same pull
-request). Only commits the run pushed itself are merged (`--match-head-commit`).
-Runs for the same slug and
-stage are serialised (`registry-tag-<slug>-<stage>`, within the caller
+registry's default branch is re-applied on top of it: force-pushed when the
+content stays the same (same pull request and token), else re-opened as a new
+pull request with a new token (`-r<n>` branch). Only commits the run pushed
+itself are merged (`--match-head-commit`). Runs for the same slug and stage
+are serialised (`registry-tag-<slug>-<stage>`, within the caller
 repository).
 
 ```yaml
@@ -208,16 +209,20 @@ registry's `tag-scope` check verifies it against the claim's `repo.url`.
 
 That line is only text: anyone who can run a workflow in an org repository can
 mint a tagger token and write any repository there. The proof is the line
-`OIDC-Token: <jwt>` in the pull request body — a GitHub Actions OIDC token with
-audience `ewws-apps-registry`, requested right before the pull request is
-opened. `tag-scope` verifies GitHub's signature and that the token was issued
-to the claim's `repo.url`, by this workflow (`job_workflow_ref`), for this
-pull request's branch (run id), within 15 minutes before the pull request was
-opened, from an event/ref allowed for the stage, and is used by no other pull
-request. **The calling job must grant `id-token: write`** (job-level
-`permissions:` as in the example, or workflow-level); without it the workflow
-opens the pull request without a token, which the registry accepts with a
-warning only until the rollout is complete.
+`OIDC-Token: <jwt>` in the pull request body — a GitHub Actions OIDC token
+requested right before the pull request is opened, with the audience
+`ewws-apps-registry:<tags|secrets>/<slug>/<stage>@<sha>`, where `<sha>` is the
+git object id of what the pull request writes (blob of the tag file, tree of
+the secrets directory). `tag-scope` verifies GitHub's signature, that the
+audience matches the pull request's head, and that the token was issued to the
+claim's `repo.url`, by this workflow (`job_workflow_ref`), for this pull
+request's branch (run id), within 15 minutes before the pull request was
+opened, from an event/ref allowed for the stage. A commit someone else pushes
+onto the branch no longer matches the token. **The calling job must grant
+`id-token: write`** (job-level `permissions:` as in the example, or
+workflow-level); without it the workflow opens the pull request without a
+token, which the registry accepts with a warning only until the rollout is
+complete.
 
 ### `write-registry-secrets.yml`
 
