@@ -24,7 +24,7 @@ name: platform-check
 #      is always scanned; on a pull request also every commit of the pull
 #      request, so a secret added and removed again inside it still fails.
 #      A `.gitleaks.toml` in the repository root is honoured. The files
-#      checked in 3. are skipped: their ciphertext is not a plaintext secret.
+#      checked in 3. are scanned too; only their ciphertext lines are ignored.
 #
 # Every check runs even when an earlier one failed, so one run lists all
 # findings.
@@ -109,7 +109,7 @@ jobs:
           echo "no binary SOPS files"
 
       # Reads SOPS metadata and SealedSecret headers only; nothing is decrypted.
-      # The gitleaks step below skips exactly the files checked here.
+      # The gitleaks step below ignores only ciphertext lines of these files.
       - name: SOPS files use the vibe key, sealed files are SealedSecrets
         if: ${{ !cancelled() }}
         env:
@@ -259,7 +259,9 @@ jobs:
         run: |
           set -euo pipefail
           # Ciphertext in SOPS files and SealedSecrets looks like secrets to
-          # gitleaks. Skip exactly the files the previous step checked; an own
+          # gitleaks. Allow only ciphertext-shaped lines (ENC[AES256_GCM,...], sops
+          # enc:, SealedSecret Ag... values) - comments, annotations and history in
+          # those files are still scanned. An own
           # .gitleaks.toml stays in force through `extend`.
           cfg="$RUNNER_TEMP/gitleaks.toml"
           if [[ -f .gitleaks.toml ]]; then
@@ -269,10 +271,12 @@ jobs:
           fi
           cat >>"$cfg" <<'EOF'
           [[allowlists]]
-          description = "SOPS-encrypted files and SealedSecrets, checked by platform-check"
-          paths = [
-            '''(^|/)[^/]+\.sops\.yaml$''',
-            '''^(\./)?deploy/sealed/.+\.yaml$''',
+          description = "SOPS and SealedSecret ciphertext lines only (checked by platform-check)"
+          regexTarget = "line"
+          regexes = [
+            '''^\s*[^\s:#][^:#]*:\s+ENC\[AES256_GCM,data:[A-Za-z0-9+/=]*,iv:[A-Za-z0-9+/=]+,tag:[A-Za-z0-9+/=]+,type:[a-z]+\]\s*$''',
+            '''^\s*enc:\s+[A-Za-z0-9+/=_-]+\s*$''',
+            '''^\s+[A-Za-z_][A-Za-z0-9_.-]*:\s+Ag[A-Za-z0-9+/=]{100,}\s*$''',
           ]
           EOF
           rc=0

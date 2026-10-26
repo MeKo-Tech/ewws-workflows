@@ -365,9 +365,9 @@ Guard rails for app repositories on the MeKo app platform. The job fails on
 - plaintext secrets found by gitleaks (pinned, checksum-verified). It scans the
   working tree and, on a pull request, every commit of the pull request;
   `scan-history: true` scans the whole history instead. A `.gitleaks.toml` in
-  the repository root is honoured. `*.sops.yaml` files and
-  `deploy/sealed/**/*.yaml` are skipped, since the checks above already cover
-  them and their ciphertext would read as secrets.
+  the repository root is honoured. In `*.sops.yaml` files and
+  SealedSecrets only ciphertext-shaped lines are ignored (`ENC[AES256_GCM,…]`,
+  sops `enc:`, `Ag…` values); comments, annotations and history are scanned.
 
 Secret values belong SOPS-encrypted in `secrets/<stage>.sops.yaml` and sealed
 with `just secrets-seal` into `deploy/sealed/<stage>/`; see
