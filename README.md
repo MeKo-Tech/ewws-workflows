@@ -120,7 +120,8 @@ has; an unchanged file is a successful no-op. The change goes through a pull
 request on a fresh `tags/<slug>-<stage>-<run>-<attempt>` branch, which the
 workflow squash-merges itself once the registry's required checks
 (`validate-apps`, `tag-scope`) are green. It retries the merge for
-`merge-timeout-minutes` (default 10) and fails the job when the checks fail or
+`merge-timeout-minutes` (default 25; a failed GitHub API call while polling is
+retried with backoff) and fails the job when the checks fail or
 the time runs out. A pull request that conflicts with or falls behind the
 registry's default branch is re-applied on top of it: force-pushed when the
 content stays the same (same pull request and token), else re-opened as a new
@@ -282,7 +283,7 @@ token against the claim's `repo.url` (see above; the calling job needs
 | `sops-file` | `secrets/<stage>.sops.yaml` | SOPS source they were sealed from. |
 | `registry-repo` | `MeKo-Tech/ewws-apps-registry` | |
 | `app-id` | `vars.EWWS_REGISTRY_TAGGER_APP_ID` | |
-| `merge-timeout-minutes` | `10` | |
+| `merge-timeout-minutes` | `25` | |
 
 Staging is published on a push to `main`, prod on a release — only when the
 sealed files changed:
