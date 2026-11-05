@@ -9,7 +9,7 @@ on:
   workflow_call:
     inputs:
       release-type:
-        description: "release-please release-type. `simple` for repos with a `version.txt`; `go` for Go modules; `node`, etc. Ignored when `config-file` is set."
+        description: "release-please release-type. `simple` for repos with a `version.txt`; `go` for Go modules; `node`, etc. Not passed to the action when `config-file` is set: the config file's `release-type` applies."
         type: string
         default: simple
       package-name:
@@ -17,7 +17,7 @@ on:
         type: string
         default: ""
       config-file:
-        description: "Path to release-please-config.json. Set this for multi-package monorepos; mutually exclusive with `release-type`."
+        description: "Path to release-please-config.json. Set this for manifest-based (e.g. multi-package) setups; when set, `release-type` is not passed to the action and the config file decides."
         type: string
         default: ""
       manifest-file:
@@ -46,12 +46,16 @@ jobs:
       # googleapis/release-please-action@v5.0.0 — pin by SHA per repo policy.
       #
       # The action accepts EITHER release-type (simple repos with one
-      # package) OR config-file/manifest-file (multi-package layout).
-      # When `config-file` is set the action ignores release-type.
+      # package) OR config-file/manifest-file (manifest layout). A non-empty
+      # release-type makes the action skip config-file/manifest-file entirely
+      # (src/index.ts, loadOrBuildManifest: `if (inputs.releaseType)` →
+      # Manifest.fromConfig). So release-type is only passed when no
+      # config-file is set; otherwise the `simple` default would override
+      # the caller's config.
       - id: rp
         uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7
         with:
-          release-type: ${{ inputs.release-type }}
+          release-type: ${{ inputs.config-file == '' && inputs.release-type || '' }}
           package-name: ${{ inputs.package-name || github.event.repository.name }}
           config-file: ${{ inputs.config-file }}
           manifest-file: ${{ inputs.manifest-file }}
