@@ -451,20 +451,33 @@ on:
     - cron: "0 4 * * 1"
   workflow_dispatch:
 
-permissions:
-  contents: read
-  issues: write
+permissions: {}
 
 jobs:
-  trivy:
+  # Pull requests: a read-only gate.
+  scan:
+    if: github.event_name == 'pull_request'
+    permissions:
+      contents: read
     uses: MeKo-Tech/ewws-workflows/.github/workflows/trivy.yml@v1
     with:
       runner: ewws-arc-ci-hetzner
-      # Pull requests are gated; scheduled and manual runs report to the issue.
-      tracking-issue: ${{ github.event_name != 'pull_request' }}
-      scanners: ${{ github.event_name == 'pull_request' && 'vuln,secret' || 'vuln,secret,misconfig' }}
+
+  # Weekly and manual runs: keep the tracking issue up to date.
+  report:
+    if: github.event_name != 'pull_request'
+    permissions:
+      contents: read
+      issues: write
+    uses: MeKo-Tech/ewws-workflows/.github/workflows/trivy.yml@v1
+    with:
+      runner: ewws-arc-ci-hetzner
+      scanners: vuln,secret,misconfig
+      tracking-issue: true
 ```
 
-`issues: write` is only needed for the tracking issue. A repository that
-already has findings can start with `fail-on-findings: false` and switch the
-gate on once they are fixed.
+The workflow declares no permissions of its own: it runs with what the calling
+job grants. Only the tracking issue needs `issues: write`, so the pull-request
+job gets by with `contents: read`. A repository that already has findings lists
+them in `.trivyignore` rather than switching the gate off with
+`fail-on-findings: false`, which would also silence the secret scanner.

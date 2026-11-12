@@ -51,8 +51,11 @@ on:
         type: boolean
         default: false
 
-permissions:
-  contents: read
+# No `permissions` block here on purpose. A called workflow can only narrow the
+# token of the calling job, never widen it, so a `contents: read` at this level
+# would take `issues: write` away from the tracking-issue run. The calling job
+# sets the permissions: `contents: read` for a gate, plus `issues: write` when
+# `tracking-issue` is true.
 
 env:
   # trivy v0.76.2 — checksums from trivy_0.76.2_checksums.txt.
