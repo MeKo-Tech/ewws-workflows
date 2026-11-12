@@ -17,6 +17,7 @@ consumer repository calls it with a single `uses:` entry.
 | `go-lint.yml` | `golangci-lint` v2 for Go modules. | `go-version`, `golangci-lint-version`, `working-directory` |
 | `claude-code-review.yml` | One Claude review per non-draft pull request, triggered by a human or an `allowed-bots` App; comments only. Guidelines are read from the base branch, out of the pull request's reach. | `runner`, `timeout-minutes`, `guidelines`, `extra-instructions`, `ci-workflow`, `allowed-bots`, `model` |
 | `platform-check.yml` | App-platform guard rails: no committed `.env`, no binary SOPS files, `*.sops.yaml` only on the vibe key, only SealedSecrets under `deploy/sealed/`, no cluster/SOPS credentials in CI, no plaintext secrets (gitleaks). | `runner`, `extra-forbidden-refs`, `scan-history` |
+| `trivy.yml` | Trivy filesystem scan (vulnerable dependencies, secrets, optionally misconfigurations). Fails the job on findings, or keeps one tracking issue up to date. | `runner`, `scanners`, `severity`, `skip-dirs`, `fail-on-findings`, `tracking-issue` |
 
 ## Calling them
 
@@ -422,3 +423,48 @@ jobs:
   platform-check:
     uses: MeKo-Tech/ewws-workflows/.github/workflows/platform-check.yml@main
 ```
+
+### `trivy.yml`
+
+Scans the repository with [Trivy](https://trivy.dev/): vulnerable dependencies
+in lockfiles and `go.mod`, plaintext secrets and, with `misconfig` in
+`scanners`, Dockerfiles and Helm charts. Only `CRITICAL` and `HIGH` findings
+count by default, and only vulnerabilities that have a fix.
+
+Findings surface in one of two ways:
+
+- **Gate** (default): the job fails. Use it for `pull_request`.
+- **Tracking issue** (`tracking-issue: true`): the job stays green and keeps one
+  issue labelled `trivy` up to date. The issue is created on the first finding,
+  rewritten on every run and closed when a scan is clean. Use it for
+  `schedule`. Our private repositories have no code scanning, so there is no
+  Security tab to report to.
+
+Trivy is a pinned release binary, verified against its checksum. To accept a
+finding, add its ID to `.trivyignore` in the repository root, with a comment
+that says why.
+
+```yaml
+on:
+  pull_request:
+  schedule:
+    - cron: "0 4 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  trivy:
+    uses: MeKo-Tech/ewws-workflows/.github/workflows/trivy.yml@v1
+    with:
+      runner: ewws-arc-ci-hetzner
+      # Pull requests are gated; scheduled and manual runs report to the issue.
+      tracking-issue: ${{ github.event_name != 'pull_request' }}
+      scanners: ${{ github.event_name == 'pull_request' && 'vuln,secret' || 'vuln,secret,misconfig' }}
+```
+
+`issues: write` is only needed for the tracking issue. A repository that
+already has findings can start with `fail-on-findings: false` and switch the
+gate on once they are fixed.

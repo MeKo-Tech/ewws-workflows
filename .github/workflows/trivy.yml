@@ -1,0 +1,195 @@
+name: trivy
+
+# Trivy filesystem scan of the caller's repository: vulnerable dependencies in
+# lockfiles and go.mod, plaintext secrets and, on request, misconfigured
+# Dockerfiles and Helm charts.
+#
+# Two ways to surface findings, chosen by the caller per event:
+#
+#   · gate (default): the job fails when there are findings. Meant for
+#     `pull_request`.
+#   · tracking issue (`tracking-issue: true`): the job stays green and keeps
+#     ONE issue labelled `trivy` up to date — created on the first finding,
+#     rewritten on every run, closed when a scan is clean. Meant for
+#     `schedule`, where a red run would only notify whoever last touched the
+#     workflow file. Our private repositories have no code scanning, so there
+#     is no Security tab to upload to.
+#
+# Only findings with a fix are reported for vulnerabilities (`--ignore-unfixed`):
+# nobody can act on the others. A `.trivyignore` or `trivy.yaml` in the
+# repository root is honoured.
+#
+# Trivy is downloaded as a release binary and checked against the pinned
+# checksum instead of going through aquasecurity/trivy-action, whose tags were
+# rewritten in the March 2026 supply-chain incident.
+
+on:
+  workflow_call:
+    inputs:
+      runner:
+        description: "Runner label for the job."
+        type: string
+        default: ubuntu-latest
+      scanners:
+        description: "Comma-separated Trivy scanners: `vuln`, `secret`, `misconfig`."
+        type: string
+        default: "vuln,secret"
+      severity:
+        description: "Comma-separated severities that count as a finding."
+        type: string
+        default: "CRITICAL,HIGH"
+      skip-dirs:
+        description: "Directories to leave out, comma-separated (e.g. vendored third-party code)."
+        type: string
+        default: ""
+      fail-on-findings:
+        description: "Fail the job when there are findings. Ignored when `tracking-issue` is true."
+        type: boolean
+        default: true
+      tracking-issue:
+        description: "Report into one issue labelled `trivy` instead of failing. Needs `issues: write`."
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+env:
+  # trivy v0.76.2 — checksums from trivy_0.76.2_checksums.txt.
+  TRIVY_VERSION: 0.76.2
+  TRIVY_SHA256_X64: bc0fc726e017b8927a62b2d3531d7a84ee01769daf5c99ed866dced54089fdbf
+  TRIVY_SHA256_ARM64: ab9d51f86e6a5fb936f605faff6b593ac51bc378fff4d3e8b9d58358b9c367c3
+
+jobs:
+  trivy:
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 15
+    steps:
+      # actions/checkout@v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+
+      - name: Install Trivy
+        run: |
+          set -euo pipefail
+          case "$(uname -m)" in
+          x86_64) asset="Linux-64bit" sum="$TRIVY_SHA256_X64" ;;
+          aarch64 | arm64) asset="Linux-ARM64" sum="$TRIVY_SHA256_ARM64" ;;
+          *)
+            echo "::error::unsupported architecture $(uname -m)"
+            exit 1
+            ;;
+          esac
+          dir="$RUNNER_TEMP/trivy"
+          mkdir -p "$dir"
+          curl -sSfL --retry 3 -o "$dir/trivy.tar.gz" \
+            "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_${asset}.tar.gz"
+          echo "${sum}  $dir/trivy.tar.gz" | sha256sum --check --quiet
+          tar -xzf "$dir/trivy.tar.gz" -C "$dir" trivy
+          echo "$dir" >> "$GITHUB_PATH"
+
+      - name: Scan
+        env:
+          SCANNERS: ${{ inputs.scanners }}
+          SEVERITY: ${{ inputs.severity }}
+          SKIP_DIRS: ${{ inputs.skip-dirs }}
+        run: |
+          set -euo pipefail
+          args=(fs --scanners "$SCANNERS" --severity "$SEVERITY" --ignore-unfixed
+            --format json --output "$RUNNER_TEMP/trivy.json" --exit-code 0 --no-progress)
+          if [ -n "$SKIP_DIRS" ]; then
+            args+=(--skip-dirs "$SKIP_DIRS")
+          fi
+          trivy "${args[@]}" .
+          # Human-readable copy for the job log.
+          trivy convert --format table "$RUNNER_TEMP/trivy.json"
+
+      - name: Summarise
+        id: summary
+        run: |
+          set -euo pipefail
+          # One row per finding. A secret's matched text is never printed, only
+          # its rule and line.
+          jq -r '
+            def cell: tostring | gsub("\\|"; "\\|") | gsub("[\\r\\n]+"; " ");
+            [ .Results[]? as $r
+              | ( ($r.Vulnerabilities // [])[]
+                  | ["vuln", .Severity, $r.Target, .PkgName, .InstalledVersion, (.FixedVersion // "-"), .VulnerabilityID] ),
+                ( ($r.Secrets // [])[]
+                  | ["secret", .Severity, $r.Target, .RuleID, "-", "-", "line \(.StartLine)"] ),
+                ( ($r.Misconfigurations // [])[]
+                  | ["misconfig", .Severity, $r.Target, .ID, "-", "-", .Title] )
+            ]
+            | unique
+            | .[]
+            | "| " + (map(cell) | join(" | ")) + " |"
+          ' "$RUNNER_TEMP/trivy.json" > "$RUNNER_TEMP/rows.md"
+
+          count="$(wc -l < "$RUNNER_TEMP/rows.md" | tr -d ' ')"
+          echo "count=$count" >> "$GITHUB_OUTPUT"
+
+          {
+            if [ "$count" -eq 0 ]; then
+              echo "Trivy found nothing to report."
+            else
+              echo "Trivy reports **$count** finding(s)."
+              echo
+              echo "| Kind | Severity | File | Package / rule | Installed | Fixed in | ID / detail |"
+              echo "| --- | --- | --- | --- | --- | --- | --- |"
+              # An issue body is limited to 65536 characters.
+              head -n 200 "$RUNNER_TEMP/rows.md"
+              if [ "$count" -gt 200 ]; then
+                echo
+                echo "Only the first 200 findings are listed; the job log has all of them."
+              fi
+            fi
+          } > "$RUNNER_TEMP/report.md"
+          cat "$RUNNER_TEMP/report.md" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Update the tracking issue
+        if: inputs.tracking-issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          COUNT: ${{ steps.summary.outputs.count }}
+          REF_NAME: ${{ github.ref_name }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          title="Trivy findings on ${REF_NAME}"
+          number="$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --label trivy \
+            --json number,title --jq "map(select(.title == \"$title\")) | .[0].number // empty")"
+
+          if [ "$COUNT" -eq 0 ]; then
+            if [ -n "$number" ]; then
+              gh issue close "$number" --repo "$GITHUB_REPOSITORY" \
+                --comment "The scan in $RUN_URL is clean."
+            fi
+            exit 0
+          fi
+
+          {
+            cat "$RUNNER_TEMP/report.md"
+            echo
+            echo "Last scan: $RUN_URL"
+            echo
+            echo "This issue is rewritten by every scheduled scan and closed when a scan is clean."
+            echo "To accept a finding, add its ID to \`.trivyignore\` with a comment that says why."
+          } > "$RUNNER_TEMP/issue.md"
+
+          if [ -n "$number" ]; then
+            gh issue edit "$number" --repo "$GITHUB_REPOSITORY" --body-file "$RUNNER_TEMP/issue.md"
+          else
+            gh label create trivy --repo "$GITHUB_REPOSITORY" --color B60205 \
+              --description "Findings of the scheduled Trivy scan" 2> /dev/null || true
+            gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" --label trivy \
+              --body-file "$RUNNER_TEMP/issue.md"
+          fi
+
+      - name: Fail on findings
+        if: inputs.fail-on-findings && !inputs.tracking-issue && steps.summary.outputs.count != '0'
+        env:
+          COUNT: ${{ steps.summary.outputs.count }}
+        run: |
+          echo "::error::Trivy reports $COUNT finding(s); see the job summary."
+          exit 1
