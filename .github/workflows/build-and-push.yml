@@ -6,21 +6,40 @@ name: build-and-push
 # the metadata-action convention so the cluster image-updater + the
 # platform-UI drift detector can both parse them:
 #
-#   type=ref,event=branch      → e.g. "main" or "deploy/foo"
+#   type=ref,event=branch      → e.g. "main", or "deploy-foo" for "deploy/foo"
+#                                (metadata-action turns anything outside
+#                                [A-Za-z0-9._-] into "-")
 #   type=ref,event=pr          → "pr-123"
 #   type=semver,pattern={...}  → "1.2.3" + "1.2" + "1"
 #   type=sha,prefix=sha-       → "sha-c69034c" (git short SHA)
+#   type=raw,value=<extra-tag> → one per line of `extra-tags`, e.g. "1.5.0-6c98a25"
 #
 # The `sha-*` tag is the one platform-UI's drift detector strips the
-# prefix from to feed into the GitHub compare API.
+# prefix from to feed into the GitHub compare API. `latest` is never pushed
+# (flavor latest=false, and `extra-tags` refuses it): which build a stage
+# runs is written down by tag, not by a moving pointer. Until `v1` is moved
+# to a commit that has this, a caller on `@v1` still gets `latest` on every
+# semver tag push (metadata-action's default latest=auto).
+#
+# A tag push whose tag is not semver (e.g. "release-7") gets no tag named
+# after it: there is no `type=ref,event=tag` rule, and adding one would push
+# an extra "v1.2.3" tag on every semver release of existing callers.
+#
+# The workflow lower-cases `image-name` in its first step and uses only that
+# name afterwards (ownership check, tags, cache ref, push), because ghcr.io
+# refuses capitals and `github.event.repository.name` keeps them.
 
 on:
   workflow_call:
     inputs:
       image-name:
-        description: "Full OCI image name without tag. Conventional value: `ghcr.io/meko-tech/<repo>`."
+        description: "Full OCI image name without tag. An image belongs to exactly one repository, and only that repository's CI pushes it: `ghcr.io/meko-tech/<repo>/<component>`, or `ghcr.io/meko-tech/<repo>` for a repository with a single image. `<repo>` is the caller's current GitHub repository name, underscores kept. The workflow writes the whole name in lower case before it uses it, so the repository name as `github.event.repository.name` gives it also works for a repository with capitals. A name that is not a plain OCI image name (host and path, no tag, digest, `,`, `=` or whitespace) fails the job whatever `image-ownership-mode` says. See `image-ownership-mode`."
         type: string
         required: true
+      image-ownership-mode:
+        description: "What happens when `image-name` is not `ghcr.io/meko-tech/<repo>` or below it: `warn` (annotation, the build goes on) or `error` (the job fails)."
+        type: string
+        default: warn
       dockerfile:
         description: "Path to the Dockerfile relative to repo root."
         type: string
@@ -53,6 +72,14 @@ on:
         description: "Job timeout. The default is GitHub's own; on our pools a hung build squats a runner slot for that long, so pass a real one."
         type: number
         default: 360
+      build-args:
+        description: "Build arguments, one `KEY=VALUE` per line, passed to docker/build-push-action unchanged (e.g. `VERSION=1.5.0`)."
+        type: string
+        default: ""
+      extra-tags:
+        description: "Additional tags, one raw tag value per line (e.g. `1.5.0-6c98a25`), each added as `type=raw,value=<tag>`. Blank lines are ignored. A value must match `[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}`; `latest` is refused."
+        type: string
+        default: ""
     secrets:
       gh-pat:
         description: "Optional GitHub token, passed to BuildKit as secret `gh_pat` (mount it with `RUN --mount=type=secret,id=gh_pat`) to fetch private modules such as ewws-auth. Not mounted at all when omitted. The Dockerfile must not write the token to a file (e.g. `git config --global`); see README."
@@ -61,6 +88,18 @@ on:
       sha-tag:
         description: "The `sha-<7>` tag that was pushed (e.g. `sha-c69034c`); empty when nothing was pushed."
         value: ${{ jobs.build.outputs.sha-tag }}
+      image:
+        description: "The image name as built and pushed: `image-name` in lower case."
+        value: ${{ jobs.build.outputs.image }}
+      tags:
+        description: "Every tag metadata-action computed, one `<image>:<tag>` per line. Also set when nothing was pushed (`push: false`, pull requests); use `sha-tag` to tell."
+        value: ${{ jobs.build.outputs.tags }}
+      version:
+        description: "metadata-action's `version`, its highest-priority tag: `1.2.3` on a semver tag push, the branch name as metadata-action writes it on a branch push (`/` and other characters outside `[A-Za-z0-9._-]` become `-`, so `deploy/foo` gives `deploy-foo`), `pr-123` on a pull request. On a tag push that is not semver no rule names the tag, so `version` is the first `extra-tags` value, or else the `sha-<7>` tag; it is never the git tag itself."
+        value: ${{ jobs.build.outputs.version }}
+      digest:
+        description: "Image digest (`sha256:…`) reported by docker/build-push-action."
+        value: ${{ jobs.build.outputs.digest }}
 
 permissions:
   contents: read
@@ -72,7 +111,66 @@ jobs:
     timeout-minutes: ${{ inputs.timeout-minutes }}
     outputs:
       sha-tag: ${{ steps.sha-tag.outputs.sha-tag }}
+      image: ${{ steps.image.outputs.image }}
+      tags: ${{ steps.meta.outputs.tags }}
+      version: ${{ steps.meta.outputs.version }}
+      digest: ${{ steps.build.outputs.digest }}
     steps:
+      # ghcr.io takes lower-case names only, and `github.event.repository.name`
+      # keeps the repository's capitals. Everything below uses this output,
+      # never `inputs.image-name`. The lower-cased name must be a plain OCI
+      # repository reference: a host (optional port) and at least one path
+      # segment, no tag, no digest. That refuses, whatever image-ownership-mode
+      # says, a `,` (metadata-action splits `images` on it, so
+      # "<owned>,ghcr.io/meko-tech/other" would pass the prefix check and push
+      # to a foreign package), `=`, `:tag`, `@sha256:…` and any whitespace,
+      # which would start another line in $GITHUB_OUTPUT. The error line escapes
+      # % CR LF so the raw value cannot end the annotation early.
+      - name: Normalize image name
+        id: image
+        env:
+          IMAGE_NAME: ${{ inputs.image-name }}
+        run: |
+          set -euo pipefail
+          image="${IMAGE_NAME,,}"
+          ref_re='^[a-z0-9]+([.-][a-z0-9]+)*(:[0-9]+)?(/[a-z0-9]+(([._]|__|-+)[a-z0-9]+)*)+$'
+          if [[ ! $image =~ $ref_re ]]; then
+            shown="${IMAGE_NAME//'%'/%25}"
+            shown="${shown//$'\r'/%0D}"
+            shown="${shown//$'\n'/%0A}"
+            echo "::error::image-name must be an OCI image name without tag or digest (host/path, e.g. ghcr.io/meko-tech/<repo>/<component>), got '${shown}'"
+            exit 1
+          fi
+          echo "image=${image}" >>"$GITHUB_OUTPUT"
+      # An image belongs to exactly one repository, and only that repository's
+      # CI pushes it. In a reusable workflow `github.repository` is the caller,
+      # so the owned prefix is ghcr.io/meko-tech/<caller repo, lower case>,
+      # followed by the end of the name or a "/".
+      - name: Check image ownership
+        env:
+          IMAGE_NAME: ${{ steps.image.outputs.image }}
+          MODE: ${{ inputs.image-ownership-mode }}
+          CALLER_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          case "$MODE" in
+          warn | error) ;;
+          *)
+            echo "::error::image-ownership-mode must be 'warn' or 'error', got '${MODE}'"
+            exit 1
+            ;;
+          esac
+          repo="${CALLER_REPO#*/}"
+          owned="ghcr.io/meko-tech/${repo,,}"
+          if [[ $IMAGE_NAME == "$owned" || $IMAGE_NAME == "$owned/"* ]]; then
+            exit 0
+          fi
+          msg="image-name '${IMAGE_NAME}' is not owned by ${CALLER_REPO}: an image belongs to exactly one repository, and only that repository's CI pushes it. Use '${owned}' or '${owned}/<component>'."
+          if [ "$MODE" = "error" ]; then
+            echo "::error title=image ownership::${msg}"
+            exit 1
+          fi
+          echo "::warning title=image ownership::${msg}"
       # Before the checkout, so a wrong call costs seconds. Our pools are amd64
       # only, and setup-qemu-action registers its emulators with the kernel
       # (binfmt_misc) of the node, which every other pod on it shares — so a
@@ -95,6 +193,55 @@ jobs:
             echo "::error::platforms is '${PLATFORMS}', but a build on our own runners must be 'linux/amd64'"
             exit 1
           fi
+      # The metadata-action tag list: the fixed rules plus one `type=raw` per
+      # line of `extra-tags`. Each value is checked against Docker's tag
+      # grammar before it goes into the list, so a value can neither add a
+      # rule of its own (`,` `=` `{` are not allowed) nor end the multi-line
+      # output early: the delimiter contains a space, which no line can.
+      - name: Build the tag list
+        id: tags
+        env:
+          EXTRA_TAGS: ${{ inputs.extra-tags }}
+        run: |
+          set -euo pipefail
+          delim="END OF TAGS"
+          failed=0
+          raw=()
+          while IFS= read -r line || [[ -n $line ]]; do
+            # trim surrounding whitespace (also a CR from a CRLF block)
+            tag="${line#"${line%%[![:space:]]*}"}"
+            tag="${tag%"${tag##*[![:space:]]}"}"
+            [[ -z $tag ]] && continue
+            # % CR LF escaped, so a raw value cannot end the annotation early
+            shown="${tag//'%'/%25}"
+            shown="${shown//$'\r'/%0D}"
+            shown="${shown//$'\n'/%0A}"
+            if [[ ${tag,,} == latest ]]; then
+              echo "::error::extra-tags: '${shown}' is refused; this workflow never pushes latest"
+              failed=1
+            elif [[ ! $tag =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$ ]]; then
+              echo "::error::extra-tags: '${shown}' is not a valid Docker tag ([A-Za-z0-9_][A-Za-z0-9_.-]{0,127})"
+              failed=1
+            else
+              raw+=("type=raw,value=${tag}")
+            fi
+          done <<<"$EXTRA_TAGS"
+          if [[ $failed -ne 0 ]]; then
+            exit 1
+          fi
+          {
+            echo "tags<<${delim}"
+            echo "type=ref,event=branch"
+            echo "type=ref,event=pr"
+            echo "type=semver,pattern={{version}}"
+            echo "type=semver,pattern={{major}}.{{minor}}"
+            echo "type=semver,pattern={{major}}"
+            echo "type=sha,prefix=sha-"
+            if [[ ${#raw[@]} -gt 0 ]]; then
+              printf '%s\n' "${raw[@]}"
+            fi
+            echo "${delim}"
+          } >>"$GITHUB_OUTPUT"
       # All action SHAs below are copied from a known-working workflow so
       # we avoid the "unable to resolve action" trap from a typo'd SHA.
       # actions/checkout@v7.0.1 — v4 runs on Node 20, which the runners now
@@ -151,26 +298,26 @@ jobs:
             image=${{ env.BUILDKIT_IMAGE }}
             cgroup-parent=inner
           buildkitd-config: ${{ env.BUILDKITD_CONFIG }}
-      # docker/login-action@v4.6.0 — `secrets: inherit` from caller gives us GITHUB_TOKEN.
+      # docker/login-action@v4.6.0 — GITHUB_TOKEN is always available to a
+      # called workflow, with the permissions the caller grants (packages:
+      # write); it needs no `secrets: inherit`.
       - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      # docker/metadata-action@v6.2.0
+      # docker/metadata-action@v6.2.0 — latest=false: the default `auto` adds `latest`
+      # on a semver tag push (the semver rules above).
       - id: meta
         uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302
         with:
-          images: ${{ inputs.image-name }}
-          tags: |
-            type=ref,event=branch
-            type=ref,event=pr
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=semver,pattern={{major}}
-            type=sha,prefix=sha-
+          images: ${{ steps.image.outputs.image }}
+          flavor: |
+            latest=false
+          tags: ${{ steps.tags.outputs.tags }}
       # docker/build-push-action@v7.4.0
-      - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc
+      - id: build
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc
         with:
           context: ${{ inputs.context }}
           file: ${{ inputs.dockerfile }}
@@ -178,11 +325,12 @@ jobs:
           push: ${{ inputs.push && github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          build-args: ${{ inputs.build-args }}
           # `registry` keeps the cache next to the image as `:buildcache` (zstd,
           # as mekorp-backend and ccbatch do). A pull request reads it but does
           # not write it: its layers would replace the default branch's.
-          cache-from: ${{ inputs.cache == 'gha' && 'type=gha' || inputs.cache == 'registry' && format('type=registry,ref={0}:buildcache', inputs.image-name) || '' }}
-          cache-to: ${{ inputs.cache == 'gha' && 'type=gha,mode=max' || inputs.cache == 'registry' && github.event_name != 'pull_request' && format('type=registry,ref={0}:buildcache,mode=max,compression=zstd,image-manifest=true,oci-mediatypes=true', inputs.image-name) || '' }}
+          cache-from: ${{ inputs.cache == 'gha' && 'type=gha' || inputs.cache == 'registry' && format('type=registry,ref={0}:buildcache', steps.image.outputs.image) || '' }}
+          cache-to: ${{ inputs.cache == 'gha' && 'type=gha,mode=max' || inputs.cache == 'registry' && github.event_name != 'pull_request' && format('type=registry,ref={0}:buildcache,mode=max,compression=zstd,image-manifest=true,oci-mediatypes=true', steps.image.outputs.image) || '' }}
           # Only when the caller passes `gh-pat`: an empty `gh_pat=` makes the
           # action warn and skip the secret anyway, so /run/secrets/gh_pat is
           # then absent rather than empty.
