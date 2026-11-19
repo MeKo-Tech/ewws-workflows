@@ -11,7 +11,7 @@ consumer repository calls it with a single `uses:` entry.
 | --- | --- | --- |
 | `test-pr-title.yml` | Conventional-Commits pull-request-title gate. | `types` |
 | `release-please.yml` | Cuts release pull requests and tags from Conventional Commits. Outputs `released` and `tag-name`. | `release-type`, `package-name`, `config-file`, `manifest-file` |
-| `build-and-push.yml` | Docker build (amd64 + arm64 by default), pushed to `ghcr.io`. Outputs `sha-tag`. | `image-name` (required), `image-ownership-mode`, `dockerfile`, `context`, `platforms`, `push`, `runner`, `cache`, `submodules`, `timeout-minutes`; optional secret `gh-pat` |
+| `build-and-push.yml` | Docker build (amd64 + arm64 by default), pushed to `ghcr.io` under the lower-cased `image-name`; never pushes `latest`. Outputs `sha-tag`, `image`, `tags`, `version`, `digest`. | `image-name` (required), `image-ownership-mode`, `dockerfile`, `context`, `platforms`, `push`, `runner`, `cache`, `submodules`, `timeout-minutes`, `build-args`, `extra-tags`; optional secret `gh-pat`. On `@v1` only `image-name`, `dockerfile`, `context`, `platforms`, `push`, `gh-pat` and the output `sha-tag` exist until `v1` is moved to a `main` that has the rest. |
 | `write-registry-tag.yml` | Writes `tags/<slug>/<stage>.yaml` in `ewws-apps-registry` through a pull request it merges itself. Outputs `pr-url` and `merge-sha`. | `slug`, `stage` (required), `backend-tag`, `frontend-tag`, `registry-repo`, `app-id`, `merge-timeout-minutes` |
 | `write-registry-secrets.yml` | Checks the caller's SealedSecrets against `sops.mac` of the SOPS source and copies them to `secrets/<slug>/<stage>/` in `ewws-apps-registry` through a pull request it merges itself. Never seals, no Azure credentials. Outputs `pr-url` and `merge-sha`. | `slug`, `stage` (required), `sealed-dir`, `sops-file`, `registry-repo`, `app-id`, `merge-timeout-minutes` |
 | `go-lint.yml` | `golangci-lint` v2 for Go modules. | `go-version`, `golangci-lint-version`, `working-directory` |
@@ -72,28 +72,111 @@ jobs:
     uses: MeKo-Tech/ewws-workflows/.github/workflows/build-and-push.yml@v1
     with:
       image-name: ghcr.io/meko-tech/${{ github.event.repository.name }}
-    secrets: inherit
 ```
+
+`secrets: inherit` is optional here: the workflow logs in to ghcr.io with
+`GITHUB_TOKEN`, which a called workflow always has, with the permissions the
+caller grants. The only secret it reads is the optional `gh-pat` below.
 
 **Ein Image gehört genau einem Repository. Nur dessen CI pusht es.** (An image
 belongs to exactly one repository, and only that repository's CI pushes it.)
 
 - The name is `ghcr.io/meko-tech/<repo>/<component>`; a repository with a
   single image uses `ghcr.io/meko-tech/<repo>`.
-- `<repo>` is the repository's current GitHub name in lower case, underscores
-  kept: `${{ github.event.repository.name }}`, not the local directory name, an
-  old image name or a registry slug. The expression does not lower-case, so a
-  repository whose name has capitals writes its name out in lower case.
+- `<repo>` is the repository's current GitHub name, underscores kept:
+  `${{ github.event.repository.name }}`, not the local directory name, an old
+  image name or a registry slug. `build-and-push.yml` writes the name in lower
+  case itself, so that expression works for a repository whose name has
+  capitals too; the ownership check, the tags, the cache ref and the push all
+  use the lower-cased name, and the `image` output returns it.
 - Slash, not hyphen: `<repo>-backend` collides between repositories such as
   `mw_ruestprotokolle_mfmw` and `mw_ruestprotokolle_mfmw_split`.
-- No generic names such as `app-backend`, no `latest` tag.
+- No generic names such as `app-backend`, no `latest` tag:
+  `build-and-push.yml` never pushes `latest` (`flavor: latest=false`, and
+  `extra-tags` refuses it).
 - Images are pushed only through this workflow, with `GITHUB_TOKEN` and
   `permissions: packages: write`, not with the org PAT `EWWS_GITHUB_TOKEN`.
 
-The first step of the job checks `image-name` against the caller repository
-(`github.repository`). `image-ownership-mode` decides what a name outside
-`ghcr.io/meko-tech/<repo>` does: `warn` (default) writes an `image ownership`
-warning and builds anyway, `error` fails the job.
+The job checks the lower-cased `image-name` against the caller repository
+(`github.repository`) before anything else. `image-ownership-mode` decides what
+a name outside `ghcr.io/meko-tech/<repo>` does: `warn` (default) writes an
+`image ownership` warning and builds anyway, `error` fails the job.
+`image-ownership-mode` is not on `@v1` yet (see the table above); a caller on
+`@v1` gets neither the check nor the lower-casing until `v1` is moved.
+
+Tags are the metadata-action rules `type=ref,event=branch`,
+`type=ref,event=pr`, `type=semver` (`{{version}}`, `{{major}}.{{minor}}`,
+`{{major}}`) and `type=sha,prefix=sha-`, plus one `type=raw` per line of
+`extra-tags`. A line of `extra-tags` is a raw tag value (`1.5.0-6c98a25`, not
+`type=…`); blank lines are skipped, and a value that is not a Docker tag
+(`[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}`) or is `latest` fails the job.
+`build-args` (one `KEY=VALUE` per line) goes to docker/build-push-action
+unchanged. Both inputs are on `@v1` only after `v1` is moved; until then use
+`@main`.
+
+A release build that also tags `<semver>-<sha7>` and bakes the version into
+the image, and a deploy job that picks up what was pushed:
+
+```yaml
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      tag: ${{ steps.v.outputs.tag }}
+    steps:
+      - id: v
+        env:
+          REF_NAME: ${{ github.ref_name }}
+          SHA: ${{ github.sha }}
+        run: |
+          version="${REF_NAME#v}"
+          echo "version=${version}" >>"$GITHUB_OUTPUT"
+          echo "tag=${version}-${SHA::7}" >>"$GITHUB_OUTPUT"
+
+  build-backend:
+    needs: version
+    uses: MeKo-Tech/ewws-workflows/.github/workflows/build-and-push.yml@main
+    with:
+      image-name: ghcr.io/meko-tech/${{ github.event.repository.name }}/backend
+      build-args: |
+        VERSION=${{ needs.version.outputs.version }}
+      extra-tags: |
+        ${{ needs.version.outputs.tag }}
+
+  deploy:
+    needs: build-backend
+    runs-on: ubuntu-latest
+    steps:
+      - env:
+          IMAGE: ${{ needs.build-backend.outputs.image }}
+          SHA_TAG: ${{ needs.build-backend.outputs.sha-tag }}
+          TAGS: ${{ needs.build-backend.outputs.tags }}
+          DIGEST: ${{ needs.build-backend.outputs.digest }}
+        run: |
+          echo "deploying ${IMAGE}:${SHA_TAG} (${DIGEST})"
+          printf 'pushed: %s\n' "$TAGS"
+```
+
+The outputs:
+
+| Output | Value |
+| --- | --- |
+| `sha-tag` | The `sha-<7>` tag that was pushed (e.g. `sha-c69034c`); empty when nothing was pushed (`push: false` or a pull request). |
+| `image` | `image-name` in lower case, as built and pushed (e.g. `ghcr.io/meko-tech/ipo-foo/backend`). |
+| `tags` | Every tag metadata-action computed, one `<image>:<tag>` per line. Also set when nothing was pushed; check `sha-tag` for that. |
+| `version` | metadata-action's `version`, its highest-priority tag: `1.2.3` on a semver tag push, the branch name on a branch push, `pr-123` on a pull request. An `extra-tags` value ranks below these. |
+| `digest` | The image digest (`sha256:…`) docker/build-push-action reports. |
+
+Only `sha-tag` is on `@v1` until `v1` is moved.
 
 A Dockerfile that fetches private Go modules (for example `ewws-auth`) gets a
 token through the optional `gh-pat` secret. It reaches BuildKit as secret
@@ -121,9 +204,6 @@ jobs:
     secrets:
       gh-pat: ${{ secrets.EWWS_GITHUB_TOKEN }}
 ```
-
-`sha-tag` is the `sha-<7>` tag that was pushed (e.g. `sha-c69034c`); it is
-empty when nothing was pushed (`push: false` or a pull request).
 
 The build runs on `ubuntu-latest` unless `runner` names one of our own pools.
 Use one that has Docker: `ewws-arc-ci-onprem`, the pool the image builds of the
@@ -204,14 +284,14 @@ jobs:
     with:
       image-name: ghcr.io/meko-tech/${{ github.event.repository.name }}/backend
       context: backend
-    secrets: inherit
+    secrets: inherit # optional for build-and-push.yml
 
   frontend:
     uses: MeKo-Tech/ewws-workflows/.github/workflows/build-and-push.yml@v1
     with:
       image-name: ghcr.io/meko-tech/${{ github.event.repository.name }}/frontend
       context: frontend
-    secrets: inherit
+    secrets: inherit # optional for build-and-push.yml
 
   tag-staging:
     needs: [backend, frontend]
