@@ -11,7 +11,7 @@ consumer repository calls it with a single `uses:` entry.
 | --- | --- | --- |
 | `test-pr-title.yml` | Conventional-Commits pull-request-title gate. | `types` |
 | `release-please.yml` | Cuts release pull requests and tags from Conventional Commits. Outputs `released` and `tag-name`. | `release-type`, `package-name`, `config-file`, `manifest-file` |
-| `build-and-push.yml` | Multi-arch (amd64 + arm64) Docker build, pushed to `ghcr.io`. Outputs `sha-tag`. | `image-name` (required), `dockerfile`, `context`, `platforms`, `push`; optional secret `gh-pat` |
+| `build-and-push.yml` | Docker build (amd64 + arm64 by default), pushed to `ghcr.io`. Outputs `sha-tag`. | `image-name` (required), `dockerfile`, `context`, `platforms`, `push`, `runner`, `cache`, `submodules`, `timeout-minutes`; optional secret `gh-pat` |
 | `write-registry-tag.yml` | Writes `tags/<slug>/<stage>.yaml` in `ewws-apps-registry` through a pull request it merges itself. Outputs `pr-url` and `merge-sha`. | `slug`, `stage` (required), `backend-tag`, `frontend-tag`, `registry-repo`, `app-id`, `merge-timeout-minutes` |
 | `write-registry-secrets.yml` | Checks the caller's SealedSecrets against `sops.mac` of the SOPS source and copies them to `secrets/<slug>/<stage>/` in `ewws-apps-registry` through a pull request it merges itself. Never seals, no Azure credentials. Outputs `pr-url` and `merge-sha`. | `slug`, `stage` (required), `sealed-dir`, `sops-file`, `registry-repo`, `app-id`, `merge-timeout-minutes` |
 | `go-lint.yml` | `golangci-lint` v2 for Go modules. | `go-version`, `golangci-lint-version`, `working-directory` |
@@ -104,6 +104,42 @@ jobs:
 
 `sha-tag` is the `sha-<7>` tag that was pushed (e.g. `sha-c69034c`); it is
 empty when nothing was pushed (`push: false` or a pull request).
+
+The build runs on `ubuntu-latest` unless `runner` names one of our own pools.
+Use one that has Docker: `ewws-arc-ci-onprem`, the pool the image builds of the
+other repositories run on. `ewws-arc-ci-small` has no Docker, and the deploy pools are
+for deploy jobs only.
+
+```yaml
+jobs:
+  build-backend:
+    uses: MeKo-Tech/ewws-workflows/.github/workflows/build-and-push.yml@main
+    with:
+      image-name: ghcr.io/meko-tech/${{ github.event.repository.name }}-backend
+      dockerfile: ./backend/Dockerfile
+      context: ./backend
+      runner: ewws-arc-ci-onprem
+      platforms: linux/amd64
+      cache: registry
+      timeout-minutes: 30
+```
+
+On our own runners the workflow hands buildx the pool's registry mirror and
+its pinned BuildKit image, so base images come from the in-cluster mirror
+instead of Docker Hub. Three things differ from a GitHub-hosted build:
+
+- **`platforms: linux/amd64` is required.** The pools are amd64 only, and
+  QEMU would register its emulators with the kernel of a node that other pods
+  share. The job fails in its first step otherwise.
+- **`cache: registry`** keeps the layer cache as `<image-name>:buildcache`
+  next to the image. `gha` works too, but sends every layer to GitHub's cache
+  over the pool's uplink and counts against the repository's cache quota there.
+  Pull requests read the registry cache and do not write it.
+- **`timeout-minutes`** defaults to GitHub's 360. Pass a real one: a hung
+  build keeps a runner slot until then.
+
+`submodules` goes to `actions/checkout` unchanged (`false`, `true`,
+`recursive`) for a Dockerfile that copies a submodule.
 
 ### `write-registry-tag.yml`
 

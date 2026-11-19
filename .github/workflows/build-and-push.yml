@@ -1,6 +1,8 @@
 name: build-and-push
 
-# Multi-arch (amd64 + arm64) Docker build, pushed to ghcr.io. Tags follow
+# Docker build (amd64 + arm64 by default), pushed to ghcr.io. Runs on a
+# GitHub-hosted runner unless `runner` names one of our own pools; the README
+# says which. Tags follow
 # the metadata-action convention so the cluster image-updater + the
 # platform-UI drift detector can both parse them:
 #
@@ -35,6 +37,22 @@ on:
         description: "Whether to push the image (skip for PR previews)."
         type: boolean
         default: true
+      runner:
+        description: "runs-on label of the build job. One of our own pools with Docker (`ewws-arc-ci-onprem`) builds there instead of on a GitHub-hosted runner; that needs `platforms: linux/amd64` and should go with `cache: registry`."
+        type: string
+        default: ubuntu-latest
+      cache:
+        description: "BuildKit layer cache: `gha` (Actions cache), `registry` (`<image-name>:buildcache` on ghcr.io, written on every event but pull_request) or `none`."
+        type: string
+        default: gha
+      submodules:
+        description: "Passed to actions/checkout as `submodules`: `false`, `true` or `recursive`."
+        type: string
+        default: "false"
+      timeout-minutes:
+        description: "Job timeout. The default is GitHub's own; on our pools a hung build squats a runner slot for that long, so pass a real one."
+        type: number
+        default: 360
     secrets:
       gh-pat:
         description: "Optional GitHub token, passed to BuildKit as secret `gh_pat` (mount it with `RUN --mount=type=secret,id=gh_pat`) to fetch private modules such as ewws-auth. Not mounted at all when omitted. The Dockerfile must not write the token to a file (e.g. `git config --global`); see README."
@@ -50,19 +68,89 @@ permissions:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: ${{ inputs.timeout-minutes }}
     outputs:
       sha-tag: ${{ steps.sha-tag.outputs.sha-tag }}
     steps:
+      # Before the checkout, so a wrong call costs seconds. Our pools are amd64
+      # only, and setup-qemu-action registers its emulators with the kernel
+      # (binfmt_misc) of the node, which every other pod on it shares — so a
+      # foreign platform is refused there rather than emulated.
+      - name: Check inputs
+        env:
+          CACHE: ${{ inputs.cache }}
+          PLATFORMS: ${{ inputs.platforms }}
+          RUNNER_KIND: ${{ runner.environment }}
+        run: |
+          set -euo pipefail
+          case "$CACHE" in
+          gha | registry | none) ;;
+          *)
+            echo "::error::cache must be 'gha', 'registry' or 'none', got '${CACHE}'"
+            exit 1
+            ;;
+          esac
+          if [ "$RUNNER_KIND" = "self-hosted" ] && [ "$PLATFORMS" != "linux/amd64" ]; then
+            echo "::error::platforms is '${PLATFORMS}', but a build on our own runners must be 'linux/amd64'"
+            exit 1
+          fi
       # All action SHAs below are copied from a known-working workflow so
       # we avoid the "unable to resolve action" trap from a typo'd SHA.
       # actions/checkout@v7.0.1 — v4 runs on Node 20, which the runners now
       # force onto Node 24 and warn about on every run.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-      # docker/setup-qemu-action@v4.4.0
-      - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1
+        with:
+          submodules: ${{ inputs.submodules }}
+      # docker/setup-qemu-action@v4.4.0 — only when something other than the
+      # runner's own architecture is built.
+      - if: inputs.platforms != 'linux/amd64'
+        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1
       # docker/setup-buildx-action@v4.4.1
-      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069
+      - if: runner.environment != 'self-hosted'
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069
+      # Our own pools (ewws-github-runner chart): the runner container carries
+      # BUILDKITD_CONFIG and BUILDKIT_IMAGE, but `${{ env.* }}` reads the Actions
+      # env context, which holds only what a workflow, job or step put there. So
+      # both are promoted into it here. Failing loudly is deliberate: an unset
+      # variable means the pool predates the chart that sets it (or is not one of
+      # ours), and building against Docker Hub on a floating BuildKit tag is the
+      # failure these settings exist to remove.
+      - name: Resolve the runner's BuildKit settings
+        if: runner.environment == 'self-hosted'
+        run: |
+          set -euo pipefail
+          if [ -z "${BUILDKITD_CONFIG:-}" ] || [ ! -r "${BUILDKITD_CONFIG}" ]; then
+            echo "::error::BUILDKITD_CONFIG is unset or not readable ('${BUILDKITD_CONFIG:-}'): this runner is not an ewws-arc-ci pool with Docker, or predates ewws-github-runner 0.21.0"
+            exit 1
+          fi
+          if [ -z "${BUILDKIT_IMAGE:-}" ]; then
+            echo "::error::BUILDKIT_IMAGE is unset: this runner predates the chart that pins BuildKit (MeKo-Tech/ewws-github-runner#176)"
+            exit 1
+          fi
+          {
+            echo "BUILDKITD_CONFIG=${BUILDKITD_CONFIG}"
+            echo "BUILDKIT_IMAGE=${BUILDKIT_IMAGE}"
+          } >>"$GITHUB_ENV"
+      # docker/setup-buildx-action@v4.4.1 — same settings as build-push.yaml in
+      # mekorp-backend, which explains each at length:
+      #   buildkitd-config  the in-cluster registry mirror. The action boots its
+      #                     own BuildKit container, which reads neither dind's
+      #                     buildkitd.toml nor the daemon's registry-mirrors, so
+      #                     without it every base image comes from Docker Hub.
+      #   network=host      lets that container reach the mirror.
+      #   image=            the BuildKit version the runner chart pins and
+      #                     prewarms, instead of the floating buildx-stable-1.
+      #   cgroup-parent     keeps the builder inside the runner pod's limits.
+      - name: Set up Docker Buildx on our own runner
+        if: runner.environment == 'self-hosted'
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069
+        with:
+          driver-opts: |
+            network=host
+            image=${{ env.BUILDKIT_IMAGE }}
+            cgroup-parent=inner
+          buildkitd-config: ${{ env.BUILDKITD_CONFIG }}
       # docker/login-action@v4.6.0 — `secrets: inherit` from caller gives us GITHUB_TOKEN.
       - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f
         with:
@@ -90,8 +178,11 @@ jobs:
           push: ${{ inputs.push && github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          # `registry` keeps the cache next to the image as `:buildcache` (zstd,
+          # as mekorp-backend and ccbatch do). A pull request reads it but does
+          # not write it: its layers would replace the default branch's.
+          cache-from: ${{ inputs.cache == 'gha' && 'type=gha' || inputs.cache == 'registry' && format('type=registry,ref={0}:buildcache', inputs.image-name) || '' }}
+          cache-to: ${{ inputs.cache == 'gha' && 'type=gha,mode=max' || inputs.cache == 'registry' && github.event_name != 'pull_request' && format('type=registry,ref={0}:buildcache,mode=max,compression=zstd,image-manifest=true,oci-mediatypes=true', inputs.image-name) || '' }}
           # Only when the caller passes `gh-pat`: an empty `gh_pat=` makes the
           # action warn and skip the secret anyway, so /run/secrets/gh_pat is
           # then absent rather than empty.
