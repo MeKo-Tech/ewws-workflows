@@ -18,9 +18,13 @@ on:
   workflow_call:
     inputs:
       image-name:
-        description: "Full OCI image name without tag. Conventional value: `ghcr.io/meko-tech/<repo>`."
+        description: "Full OCI image name without tag. An image belongs to exactly one repository, and only that repository's CI pushes it: `ghcr.io/meko-tech/<repo>/<component>`, or `ghcr.io/meko-tech/<repo>` for a repository with a single image. `<repo>` is the caller's current GitHub repository name in lower case, underscores kept. See `image-ownership-mode`."
         type: string
         required: true
+      image-ownership-mode:
+        description: "What happens when `image-name` is not `ghcr.io/meko-tech/<repo>` or below it: `warn` (annotation, the build goes on) or `error` (the job fails)."
+        type: string
+        default: warn
       dockerfile:
         description: "Path to the Dockerfile relative to repo root."
         type: string
@@ -73,6 +77,35 @@ jobs:
     outputs:
       sha-tag: ${{ steps.sha-tag.outputs.sha-tag }}
     steps:
+      # An image belongs to exactly one repository, and only that repository's
+      # CI pushes it. In a reusable workflow `github.repository` is the caller,
+      # so the owned prefix is ghcr.io/meko-tech/<caller repo, lower case>,
+      # followed by the end of the name or a "/".
+      - name: Check image ownership
+        env:
+          IMAGE_NAME: ${{ inputs.image-name }}
+          MODE: ${{ inputs.image-ownership-mode }}
+          CALLER_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          case "$MODE" in
+          warn | error) ;;
+          *)
+            echo "::error::image-ownership-mode must be 'warn' or 'error', got '${MODE}'"
+            exit 1
+            ;;
+          esac
+          repo="${CALLER_REPO#*/}"
+          owned="ghcr.io/meko-tech/${repo,,}"
+          if [[ $IMAGE_NAME == "$owned" || $IMAGE_NAME == "$owned/"* ]]; then
+            exit 0
+          fi
+          msg="image-name '${IMAGE_NAME}' is not owned by ${CALLER_REPO}: an image belongs to exactly one repository, and only that repository's CI pushes it. Use '${owned}' or '${owned}/<component>'."
+          if [ "$MODE" = "error" ]; then
+            echo "::error title=image ownership::${msg}"
+            exit 1
+          fi
+          echo "::warning title=image ownership::${msg}"
       # Before the checkout, so a wrong call costs seconds. Our pools are amd64
       # only, and setup-qemu-action registers its emulators with the kernel
       # (binfmt_misc) of the node, which every other pod on it shares — so a

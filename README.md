@@ -11,7 +11,7 @@ consumer repository calls it with a single `uses:` entry.
 | --- | --- | --- |
 | `test-pr-title.yml` | Conventional-Commits pull-request-title gate. | `types` |
 | `release-please.yml` | Cuts release pull requests and tags from Conventional Commits. Outputs `released` and `tag-name`. | `release-type`, `package-name`, `config-file`, `manifest-file` |
-| `build-and-push.yml` | Docker build (amd64 + arm64 by default), pushed to `ghcr.io`. Outputs `sha-tag`. | `image-name` (required), `dockerfile`, `context`, `platforms`, `push`, `runner`, `cache`, `submodules`, `timeout-minutes`; optional secret `gh-pat` |
+| `build-and-push.yml` | Docker build (amd64 + arm64 by default), pushed to `ghcr.io`. Outputs `sha-tag`. | `image-name` (required), `image-ownership-mode`, `dockerfile`, `context`, `platforms`, `push`, `runner`, `cache`, `submodules`, `timeout-minutes`; optional secret `gh-pat` |
 | `write-registry-tag.yml` | Writes `tags/<slug>/<stage>.yaml` in `ewws-apps-registry` through a pull request it merges itself. Outputs `pr-url` and `merge-sha`. | `slug`, `stage` (required), `backend-tag`, `frontend-tag`, `registry-repo`, `app-id`, `merge-timeout-minutes` |
 | `write-registry-secrets.yml` | Checks the caller's SealedSecrets against `sops.mac` of the SOPS source and copies them to `secrets/<slug>/<stage>/` in `ewws-apps-registry` through a pull request it merges itself. Never seals, no Azure credentials. Outputs `pr-url` and `merge-sha`. | `slug`, `stage` (required), `sealed-dir`, `sops-file`, `registry-repo`, `app-id`, `merge-timeout-minutes` |
 | `go-lint.yml` | `golangci-lint` v2 for Go modules. | `go-version`, `golangci-lint-version`, `working-directory` |
@@ -75,6 +75,26 @@ jobs:
     secrets: inherit
 ```
 
+**Ein Image gehört genau einem Repository. Nur dessen CI pusht es.** (An image
+belongs to exactly one repository, and only that repository's CI pushes it.)
+
+- The name is `ghcr.io/meko-tech/<repo>/<component>`; a repository with a
+  single image uses `ghcr.io/meko-tech/<repo>`.
+- `<repo>` is the repository's current GitHub name in lower case, underscores
+  kept: `${{ github.event.repository.name }}`, not the local directory name, an
+  old image name or a registry slug. The expression does not lower-case, so a
+  repository whose name has capitals writes its name out in lower case.
+- Slash, not hyphen: `<repo>-backend` collides between repositories such as
+  `mw_ruestprotokolle_mfmw` and `mw_ruestprotokolle_mfmw_split`.
+- No generic names such as `app-backend`, no `latest` tag.
+- Images are pushed only through this workflow, with `GITHUB_TOKEN` and
+  `permissions: packages: write`, not with the org PAT `EWWS_GITHUB_TOKEN`.
+
+The first step of the job checks `image-name` against the caller repository
+(`github.repository`). `image-ownership-mode` decides what a name outside
+`ghcr.io/meko-tech/<repo>` does: `warn` (default) writes an `image ownership`
+warning and builds anyway, `error` fails the job.
+
 A Dockerfile that fetches private Go modules (for example `ewws-auth`) gets a
 token through the optional `gh-pat` secret. It reaches BuildKit as secret
 `gh_pat`. Keep the token out of every file: `git config --global` would write it
@@ -96,7 +116,7 @@ jobs:
   build-backend:
     uses: MeKo-Tech/ewws-workflows/.github/workflows/build-and-push.yml@main
     with:
-      image-name: ghcr.io/meko-tech/${{ github.event.repository.name }}-backend
+      image-name: ghcr.io/meko-tech/${{ github.event.repository.name }}/backend
       dockerfile: ./backend/deployment/Dockerfile
     secrets:
       gh-pat: ${{ secrets.EWWS_GITHUB_TOKEN }}
@@ -115,7 +135,7 @@ jobs:
   build-backend:
     uses: MeKo-Tech/ewws-workflows/.github/workflows/build-and-push.yml@main
     with:
-      image-name: ghcr.io/meko-tech/${{ github.event.repository.name }}-backend
+      image-name: ghcr.io/meko-tech/${{ github.event.repository.name }}/backend
       dockerfile: ./backend/Dockerfile
       context: ./backend
       runner: ewws-arc-ci-onprem
@@ -182,14 +202,14 @@ jobs:
   backend:
     uses: MeKo-Tech/ewws-workflows/.github/workflows/build-and-push.yml@v1
     with:
-      image-name: ghcr.io/meko-tech/${{ github.event.repository.name }}-backend
+      image-name: ghcr.io/meko-tech/${{ github.event.repository.name }}/backend
       context: backend
     secrets: inherit
 
   frontend:
     uses: MeKo-Tech/ewws-workflows/.github/workflows/build-and-push.yml@v1
     with:
-      image-name: ghcr.io/meko-tech/${{ github.event.repository.name }}-frontend
+      image-name: ghcr.io/meko-tech/${{ github.event.repository.name }}/frontend
       context: frontend
     secrets: inherit
 
