@@ -179,11 +179,22 @@ The outputs:
 
 A Dockerfile that fetches private Go modules (for example `ewws-auth`) gets a
 token through the optional `gh-pat` secret. It reaches BuildKit as secret
-`gh_pat`. Keep the token out of every file: `git config --global` would write it
-into `~/.gitconfig` of that layer, and `cache-to: mode=max` exports
-intermediate layers to the Actions cache. Pass the URL rewrite through
-command-scoped Git environment variables instead. When the caller passes no
-`gh-pat`, `/run/secrets/gh_pat` does not exist.
+`gh_pat`. When the caller passes no `gh-pat`, `/run/secrets/gh_pat` does not
+exist.
+
+Rule for the Dockerfile: the token never goes into a file. `git config
+--global` would write it into `~/.gitconfig` of that layer, and the layer ends
+up in the build cache and possibly in the image. Pass the URL rewrite through
+`GIT_CONFIG_*` environment variables scoped to the one command that needs it,
+as below.
+
+With `gh-pat` set, the workflow exports the build cache (`cache: gha` or
+`registry`) with `mode=min`: only the layers of the final image, not the
+builder stages. A builder stage that ran `go mod download` against private
+modules holds their source, and `mode=max` would put that into
+`<image-name>:buildcache` or the Actions cache, where anyone who can read that
+package or cache can read it. The builder stages stay on the runner, so they are
+rebuilt on a cold runner. Without `gh-pat` the cache keeps `mode=max`.
 
 ```dockerfile
 RUN --mount=type=secret,id=gh_pat \
