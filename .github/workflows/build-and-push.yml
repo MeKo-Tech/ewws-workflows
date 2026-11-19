@@ -26,6 +26,13 @@ name: build-and-push
 # The workflow lower-cases `image-name` in its first step and uses only that
 # name afterwards (ownership check, tags, cache ref, push), because ghcr.io
 # refuses capitals and `github.event.repository.name` keeps them.
+#
+# The layer cache (`cache: gha` or `registry`) is exported with mode=max,
+# except when the caller passes `gh-pat`: then mode=min, so only the layers of
+# the final image are cached. Builder stages that fetched private modules with
+# the token hold their source, and mode=max would export them to
+# `<image>:buildcache` or the Actions cache, readable by anyone who can read
+# that package or cache.
 
 on:
   workflow_call:
@@ -327,8 +334,13 @@ jobs:
           # `registry` keeps the cache next to the image as `:buildcache` (zstd,
           # as mekorp-backend and ccbatch do). A pull request reads it but does
           # not write it: its layers would replace the default branch's.
+          # With `gh-pat` the cache is written with mode=min: only the layers of
+          # the final image, not the builder stages. A builder stage that ran
+          # `go mod download` against private modules holds their source, and
+          # mode=max would put it into `:buildcache` or the Actions cache, where
+          # anyone who can read that package or cache can read it.
           cache-from: ${{ inputs.cache == 'gha' && 'type=gha' || inputs.cache == 'registry' && format('type=registry,ref={0}:buildcache', steps.image.outputs.image) || '' }}
-          cache-to: ${{ inputs.cache == 'gha' && 'type=gha,mode=max' || inputs.cache == 'registry' && github.event_name != 'pull_request' && format('type=registry,ref={0}:buildcache,mode=max,compression=zstd,image-manifest=true,oci-mediatypes=true', steps.image.outputs.image) || '' }}
+          cache-to: ${{ inputs.cache == 'gha' && format('type=gha,mode={0}', secrets.gh-pat != '' && 'min' || 'max') || inputs.cache == 'registry' && github.event_name != 'pull_request' && format('type=registry,ref={0}:buildcache,mode={1},compression=zstd,image-manifest=true,oci-mediatypes=true', steps.image.outputs.image, secrets.gh-pat != '' && 'min' || 'max') || '' }}
           # Only when the caller passes `gh-pat`: an empty `gh_pat=` makes the
           # action warn and skip the secret anyway, so /run/secrets/gh_pat is
           # then absent rather than empty.
