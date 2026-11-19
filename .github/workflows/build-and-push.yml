@@ -6,7 +6,9 @@ name: build-and-push
 # the metadata-action convention so the cluster image-updater + the
 # platform-UI drift detector can both parse them:
 #
-#   type=ref,event=branch      → e.g. "main" or "deploy/foo"
+#   type=ref,event=branch      → e.g. "main", or "deploy-foo" for "deploy/foo"
+#                                (metadata-action turns anything outside
+#                                [A-Za-z0-9._-] into "-")
 #   type=ref,event=pr          → "pr-123"
 #   type=semver,pattern={...}  → "1.2.3" + "1.2" + "1"
 #   type=sha,prefix=sha-       → "sha-c69034c" (git short SHA)
@@ -15,7 +17,13 @@ name: build-and-push
 # The `sha-*` tag is the one platform-UI's drift detector strips the
 # prefix from to feed into the GitHub compare API. `latest` is never pushed
 # (flavor latest=false, and `extra-tags` refuses it): which build a stage
-# runs is written down by tag, not by a moving pointer.
+# runs is written down by tag, not by a moving pointer. Until `v1` is moved
+# to a commit that has this, a caller on `@v1` still gets `latest` on every
+# semver tag push (metadata-action's default latest=auto).
+#
+# A tag push whose tag is not semver (e.g. "release-7") gets no tag named
+# after it: there is no `type=ref,event=tag` rule, and adding one would push
+# an extra "v1.2.3" tag on every semver release of existing callers.
 #
 # The workflow lower-cases `image-name` in its first step and uses only that
 # name afterwards (ownership check, tags, cache ref, push), because ghcr.io
@@ -25,7 +33,7 @@ on:
   workflow_call:
     inputs:
       image-name:
-        description: "Full OCI image name without tag. An image belongs to exactly one repository, and only that repository's CI pushes it: `ghcr.io/meko-tech/<repo>/<component>`, or `ghcr.io/meko-tech/<repo>` for a repository with a single image. `<repo>` is the caller's current GitHub repository name, underscores kept. The workflow writes the whole name in lower case before it uses it, so the repository name as `github.event.repository.name` gives it also works for a repository with capitals. See `image-ownership-mode`."
+        description: "Full OCI image name without tag. An image belongs to exactly one repository, and only that repository's CI pushes it: `ghcr.io/meko-tech/<repo>/<component>`, or `ghcr.io/meko-tech/<repo>` for a repository with a single image. `<repo>` is the caller's current GitHub repository name, underscores kept. The workflow writes the whole name in lower case before it uses it, so the repository name as `github.event.repository.name` gives it also works for a repository with capitals. A name that is not a plain OCI image name (host and path, no tag, digest, `,`, `=` or whitespace) fails the job whatever `image-ownership-mode` says. See `image-ownership-mode`."
         type: string
         required: true
       image-ownership-mode:
@@ -87,7 +95,7 @@ on:
         description: "Every tag metadata-action computed, one `<image>:<tag>` per line. Also set when nothing was pushed (`push: false`, pull requests); use `sha-tag` to tell."
         value: ${{ jobs.build.outputs.tags }}
       version:
-        description: "metadata-action's `version`, its highest-priority tag: `1.2.3` on a semver tag push, the branch name on a branch push, `pr-123` on a pull request. An `extra-tags` value ranks below these."
+        description: "metadata-action's `version`, its highest-priority tag: `1.2.3` on a semver tag push, the branch name as metadata-action writes it on a branch push (`/` and other characters outside `[A-Za-z0-9._-]` become `-`, so `deploy/foo` gives `deploy-foo`), `pr-123` on a pull request. On a tag push that is not semver no rule names the tag, so `version` is the first `extra-tags` value, or else the `sha-<7>` tag; it is never the git tag itself."
         value: ${{ jobs.build.outputs.version }}
       digest:
         description: "Image digest (`sha256:…`) reported by docker/build-push-action."
@@ -110,19 +118,30 @@ jobs:
     steps:
       # ghcr.io takes lower-case names only, and `github.event.repository.name`
       # keeps the repository's capitals. Everything below uses this output,
-      # never `inputs.image-name`. Whitespace is refused because the value is
-      # written to $GITHUB_OUTPUT, where a newline would start another output.
+      # never `inputs.image-name`. The lower-cased name must be a plain OCI
+      # repository reference: a host (optional port) and at least one path
+      # segment, no tag, no digest. That refuses, whatever image-ownership-mode
+      # says, a `,` (metadata-action splits `images` on it, so
+      # "<owned>,ghcr.io/meko-tech/other" would pass the prefix check and push
+      # to a foreign package), `=`, `:tag`, `@sha256:…` and any whitespace,
+      # which would start another line in $GITHUB_OUTPUT. The error line escapes
+      # % CR LF so the raw value cannot end the annotation early.
       - name: Normalize image name
         id: image
         env:
           IMAGE_NAME: ${{ inputs.image-name }}
         run: |
           set -euo pipefail
-          if [[ -z $IMAGE_NAME || $IMAGE_NAME =~ [[:space:]] ]]; then
-            echo "::error::image-name must be non-empty and contain no whitespace, got '${IMAGE_NAME}'"
+          image="${IMAGE_NAME,,}"
+          ref_re='^[a-z0-9]+([.-][a-z0-9]+)*(:[0-9]+)?(/[a-z0-9]+(([._]|__|-+)[a-z0-9]+)*)+$'
+          if [[ ! $image =~ $ref_re ]]; then
+            shown="${IMAGE_NAME//'%'/%25}"
+            shown="${shown//$'\r'/%0D}"
+            shown="${shown//$'\n'/%0A}"
+            echo "::error::image-name must be an OCI image name without tag or digest (host/path, e.g. ghcr.io/meko-tech/<repo>/<component>), got '${shown}'"
             exit 1
           fi
-          echo "image=${IMAGE_NAME,,}" >>"$GITHUB_OUTPUT"
+          echo "image=${image}" >>"$GITHUB_OUTPUT"
       # An image belongs to exactly one repository, and only that repository's
       # CI pushes it. In a reusable workflow `github.repository` is the caller,
       # so the owned prefix is ghcr.io/meko-tech/<caller repo, lower case>,
@@ -193,11 +212,15 @@ jobs:
             tag="${line#"${line%%[![:space:]]*}"}"
             tag="${tag%"${tag##*[![:space:]]}"}"
             [[ -z $tag ]] && continue
+            # % CR LF escaped, so a raw value cannot end the annotation early
+            shown="${tag//'%'/%25}"
+            shown="${shown//$'\r'/%0D}"
+            shown="${shown//$'\n'/%0A}"
             if [[ ${tag,,} == latest ]]; then
-              echo "::error::extra-tags: '${tag}' is refused; this workflow never pushes latest"
+              echo "::error::extra-tags: '${shown}' is refused; this workflow never pushes latest"
               failed=1
             elif [[ ! $tag =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$ ]]; then
-              echo "::error::extra-tags: '${tag}' is not a valid Docker tag ([A-Za-z0-9_][A-Za-z0-9_.-]{0,127})"
+              echo "::error::extra-tags: '${shown}' is not a valid Docker tag ([A-Za-z0-9_][A-Za-z0-9_.-]{0,127})"
               failed=1
             else
               raw+=("type=raw,value=${tag}")

@@ -11,7 +11,7 @@ consumer repository calls it with a single `uses:` entry.
 | --- | --- | --- |
 | `test-pr-title.yml` | Conventional-Commits pull-request-title gate. | `types` |
 | `release-please.yml` | Cuts release pull requests and tags from Conventional Commits. Outputs `released` and `tag-name`. | `release-type`, `package-name`, `config-file`, `manifest-file` |
-| `build-and-push.yml` | Docker build (amd64 + arm64 by default), pushed to `ghcr.io` under the lower-cased `image-name`; never pushes `latest`. Outputs `sha-tag`, `image`, `tags`, `version`, `digest`. | `image-name` (required), `image-ownership-mode`, `dockerfile`, `context`, `platforms`, `push`, `runner`, `cache`, `submodules`, `timeout-minutes`, `build-args`, `extra-tags`; optional secret `gh-pat`. On `@v1` only `image-name`, `dockerfile`, `context`, `platforms`, `push`, `gh-pat` and the output `sha-tag` exist until `v1` is moved to a `main` that has the rest. |
+| `build-and-push.yml` | Docker build (amd64 + arm64 by default), pushed to `ghcr.io` under the lower-cased `image-name`; never pushes `latest` (on `@v1` it still does on a semver tag push until `v1` is moved). Outputs `sha-tag`, `image`, `tags`, `version`, `digest`. | `image-name` (required), `image-ownership-mode`, `dockerfile`, `context`, `platforms`, `push`, `runner`, `cache`, `submodules`, `timeout-minutes`, `build-args`, `extra-tags`; optional secret `gh-pat`. On `@v1` only `image-name`, `dockerfile`, `context`, `platforms`, `push`, `gh-pat` and the output `sha-tag` exist until `v1` is moved to a `main` that has the rest. |
 | `write-registry-tag.yml` | Writes `tags/<slug>/<stage>.yaml` in `ewws-apps-registry` through a pull request it merges itself. Outputs `pr-url` and `merge-sha`. | `slug`, `stage` (required), `backend-tag`, `frontend-tag`, `registry-repo`, `app-id`, `merge-timeout-minutes` |
 | `write-registry-secrets.yml` | Checks the caller's SealedSecrets against `sops.mac` of the SOPS source and copies them to `secrets/<slug>/<stage>/` in `ewws-apps-registry` through a pull request it merges itself. Never seals, no Azure credentials. Outputs `pr-url` and `merge-sha`. | `slug`, `stage` (required), `sealed-dir`, `sops-file`, `registry-repo`, `app-id`, `merge-timeout-minutes` |
 | `go-lint.yml` | `golangci-lint` v2 for Go modules. | `go-version`, `golangci-lint-version`, `working-directory` |
@@ -93,12 +93,18 @@ belongs to exactly one repository, and only that repository's CI pushes it.)
   `mw_ruestprotokolle_mfmw` and `mw_ruestprotokolle_mfmw_split`.
 - No generic names such as `app-backend`, no `latest` tag:
   `build-and-push.yml` never pushes `latest` (`flavor: latest=false`, and
-  `extra-tags` refuses it).
+  `extra-tags` refuses it). Until `v1` is moved, a caller on `@v1` still
+  gets `latest` on every semver tag push (metadata-action's default
+  `latest=auto`); use `@main` to drop it now.
 - Images are pushed only through this workflow, with `GITHUB_TOKEN` and
   `permissions: packages: write`, not with the org PAT `EWWS_GITHUB_TOKEN`.
 
-The job checks the lower-cased `image-name` against the caller repository
-(`github.repository`) before anything else. `image-ownership-mode` decides what
+The job first checks that the lower-cased `image-name` is a plain OCI image
+name: a host (optional port) and at least one path segment, no tag, no
+digest. Anything else (`,`, `=`, `:tag`, `@sha256:…`, whitespace) fails the
+job in either `image-ownership-mode`; a comma would otherwise let
+metadata-action split the value into a second, foreign image. It then checks
+the name against the caller repository (`github.repository`). `image-ownership-mode` decides what
 a name outside `ghcr.io/meko-tech/<repo>` does: `warn` (default) writes an
 `image ownership` warning and builds anyway, `error` fails the job.
 `image-ownership-mode` is not on `@v1` yet (see the table above); a caller on
@@ -173,7 +179,7 @@ The outputs:
 | `sha-tag` | The `sha-<7>` tag that was pushed (e.g. `sha-c69034c`); empty when nothing was pushed (`push: false` or a pull request). |
 | `image` | `image-name` in lower case, as built and pushed (e.g. `ghcr.io/meko-tech/ipo-foo/backend`). |
 | `tags` | Every tag metadata-action computed, one `<image>:<tag>` per line. Also set when nothing was pushed; check `sha-tag` for that. |
-| `version` | metadata-action's `version`, its highest-priority tag: `1.2.3` on a semver tag push, the branch name on a branch push, `pr-123` on a pull request. An `extra-tags` value ranks below these. |
+| `version` | metadata-action's `version`, its highest-priority tag: `1.2.3` on a semver tag push, the branch name as metadata-action writes it on a branch push (characters outside `[A-Za-z0-9._-]` become `-`, so `deploy/foo` gives `deploy-foo`), `pr-123` on a pull request. On a tag push that is not semver no rule names the tag (there is no `type=ref,event=tag`; adding it would push an extra `v1.2.3` tag on every release of existing callers), so `version` is the first `extra-tags` value, or else the `sha-<7>` tag, never the git tag. |
 | `digest` | The image digest (`sha256:…`) docker/build-push-action reports. |
 
 Only `sha-tag` is on `@v1` until `v1` is moved.
