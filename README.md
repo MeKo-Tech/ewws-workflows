@@ -11,7 +11,7 @@ consumer repository calls it with a single `uses:` entry.
 | --- | --- | --- |
 | `test-pr-title.yml` | Conventional-Commits pull-request-title gate. | `types` |
 | `release-please.yml` | Cuts release pull requests and tags from Conventional Commits. Outputs `released` and `tag-name`. | `release-type`, `package-name`, `config-file`, `manifest-file` |
-| `build-and-push.yml` | Docker build (amd64 + arm64 by default), pushed to `ghcr.io` under the lower-cased `image-name`; never pushes `latest` (on `@v1` it still does on a semver tag push until `v1` is moved). Outputs `sha-tag`, `image`, `tags`, `version`, `digest`. | `image-name` (required), `image-ownership-mode`, `dockerfile`, `context`, `platforms`, `push`, `runner`, `cache`, `submodules`, `timeout-minutes`, `build-args`, `extra-tags`; optional secret `gh-pat`. On `@v1` only `image-name`, `dockerfile`, `context`, `platforms`, `push`, `gh-pat` and the output `sha-tag` exist until `v1` is moved to a `main` that has the rest. |
+| `build-and-push.yml` | Docker build (amd64 + arm64 by default), pushed to `ghcr.io` under the lower-cased `image-name`; never pushes `latest`. Outputs `sha-tag`, `image`, `tags`, `version`, `digest`. | `image-name` (required), `image-ownership-mode`, `dockerfile`, `context`, `platforms`, `push`, `runner`, `cache`, `submodules`, `timeout-minutes`, `build-args`, `extra-tags`; optional secret `gh-pat`. |
 | `write-registry-tag.yml` | Writes `tags/<slug>/<stage>.yaml` in `ewws-apps-registry` through a pull request it merges itself. Outputs `pr-url` and `merge-sha`. | `slug`, `stage` (required), `backend-tag`, `frontend-tag`, `registry-repo`, `app-id`, `merge-timeout-minutes` |
 | `write-registry-secrets.yml` | Checks the caller's SealedSecrets against `sops.mac` of the SOPS source and copies them to `secrets/<slug>/<stage>/` in `ewws-apps-registry` through a pull request it merges itself. Never seals, no Azure credentials. Outputs `pr-url` and `merge-sha`. | `slug`, `stage` (required), `sealed-dir`, `sops-file`, `registry-repo`, `app-id`, `merge-timeout-minutes` |
 | `go-lint.yml` | `golangci-lint` v2 for Go modules. | `go-version`, `golangci-lint-version`, `working-directory` |
@@ -93,9 +93,7 @@ belongs to exactly one repository, and only that repository's CI pushes it.)
   `mw_ruestprotokolle_mfmw` and `mw_ruestprotokolle_mfmw_split`.
 - No generic names such as `app-backend`, no `latest` tag:
   `build-and-push.yml` never pushes `latest` (`flavor: latest=false`, and
-  `extra-tags` refuses it). Until `v1` is moved, a caller on `@v1` still
-  gets `latest` on every semver tag push (metadata-action's default
-  `latest=auto`); use `@main` to drop it now.
+  `extra-tags` refuses it).
 - Images are pushed only through this workflow, with `GITHUB_TOKEN` and
   `permissions: packages: write`, not with the org PAT `EWWS_GITHUB_TOKEN`.
 
@@ -107,8 +105,6 @@ metadata-action split the value into a second, foreign image. It then checks
 the name against the caller repository (`github.repository`). `image-ownership-mode` decides what
 a name outside `ghcr.io/meko-tech/<repo>` does: `warn` (default) writes an
 `image ownership` warning and builds anyway, `error` fails the job.
-`image-ownership-mode` is not on `@v1` yet (see the table above); a caller on
-`@v1` gets neither the check nor the lower-casing until `v1` is moved.
 
 Tags are the metadata-action rules `type=ref,event=branch`,
 `type=ref,event=pr`, `type=semver` (`{{version}}`, `{{major}}.{{minor}}`,
@@ -117,8 +113,7 @@ Tags are the metadata-action rules `type=ref,event=branch`,
 `type=…`); blank lines are skipped, and a value that is not a Docker tag
 (`[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}`) or is `latest` fails the job.
 `build-args` (one `KEY=VALUE` per line) goes to docker/build-push-action
-unchanged. Both inputs are on `@v1` only after `v1` is moved; until then use
-`@main`.
+unchanged.
 
 A release build that also tags `<semver>-<sha7>` and bakes the version into
 the image, and a deploy job that picks up what was pushed:
@@ -150,7 +145,7 @@ jobs:
 
   build-backend:
     needs: version
-    uses: MeKo-Tech/ewws-workflows/.github/workflows/build-and-push.yml@main
+    uses: MeKo-Tech/ewws-workflows/.github/workflows/build-and-push.yml@v1
     with:
       image-name: ghcr.io/meko-tech/${{ github.event.repository.name }}/backend
       build-args: |
@@ -182,8 +177,6 @@ The outputs:
 | `version` | metadata-action's `version`, its highest-priority tag: `1.2.3` on a semver tag push, the branch name as metadata-action writes it on a branch push (characters outside `[A-Za-z0-9._-]` become `-`, so `deploy/foo` gives `deploy-foo`), `pr-123` on a pull request. On a tag push that is not semver no rule names the tag (there is no `type=ref,event=tag`; adding it would push an extra `v1.2.3` tag on every release of existing callers), so `version` is the first `extra-tags` value, or else the `sha-<7>` tag, never the git tag. |
 | `digest` | The image digest (`sha256:…`) docker/build-push-action reports. |
 
-Only `sha-tag` is on `@v1` until `v1` is moved.
-
 A Dockerfile that fetches private Go modules (for example `ewws-auth`) gets a
 token through the optional `gh-pat` secret. It reaches BuildKit as secret
 `gh_pat`. Keep the token out of every file: `git config --global` would write it
@@ -203,7 +196,7 @@ RUN --mount=type=secret,id=gh_pat \
 ```yaml
 jobs:
   build-backend:
-    uses: MeKo-Tech/ewws-workflows/.github/workflows/build-and-push.yml@main
+    uses: MeKo-Tech/ewws-workflows/.github/workflows/build-and-push.yml@v1
     with:
       image-name: ghcr.io/meko-tech/${{ github.event.repository.name }}/backend
       dockerfile: ./backend/deployment/Dockerfile
@@ -219,7 +212,7 @@ for deploy jobs only.
 ```yaml
 jobs:
   build-backend:
-    uses: MeKo-Tech/ewws-workflows/.github/workflows/build-and-push.yml@main
+    uses: MeKo-Tech/ewws-workflows/.github/workflows/build-and-push.yml@v1
     with:
       image-name: ghcr.io/meko-tech/${{ github.event.repository.name }}/backend
       dockerfile: ./backend/Dockerfile

@@ -17,9 +17,7 @@ name: build-and-push
 # The `sha-*` tag is the one platform-UI's drift detector strips the
 # prefix from to feed into the GitHub compare API. `latest` is never pushed
 # (flavor latest=false, and `extra-tags` refuses it): which build a stage
-# runs is written down by tag, not by a moving pointer. Until `v1` is moved
-# to a commit that has this, a caller on `@v1` still gets `latest` on every
-# semver tag push (metadata-action's default latest=auto).
+# runs is written down by tag, not by a moving pointer.
 #
 # A tag push whose tag is not semver (e.g. "release-7") gets no tag named
 # after it: there is no `type=ref,event=tag` rule, and adding one would push
