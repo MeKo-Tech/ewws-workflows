@@ -251,6 +251,39 @@ instead of Docker Hub. Three things differ from a GitHub-hosted build:
 `submodules` goes to `actions/checkout` unchanged (`false`, `true`,
 `recursive`) for a Dockerfile that copies a submodule.
 
+#### Pull access
+
+Every cluster (chungus and DigitalOcean) pulls with the org account
+`mekoAutomation` through the `regcred` pull secret, which needs only
+`read:packages`. A new package needs no manual grant:
+
+- The first `GITHUB_TOKEN` push from this workflow creates the package linked
+  to the repository, with "Inherit access from source repository" on.
+- The org base permission is `write`, so `mekoAutomation`, an org member, can
+  read every repository and therefore every package that inherits from one.
+  Pulling needs only `read`; setting the base permission to "No permission"
+  without another grant breaks this for every inheriting package.
+- A package that does not inherit (direct members only) needs the team
+  `@ewws` with Read; `mekoAutomation` is in that team.
+- A Dockerfile whose `FROM` is a private package of another repository needs
+  "Manage Actions access: Read" for the building repository in that package's
+  settings. `GITHUB_TOKEN` reads no other package without it.
+
+Renaming an image that something deploys: (1) the workflow pushes the new
+name, (2) the consumer switches (registry claim or Helm values), (3) the old
+package is deleted after sign-off. There is no PAT mirror step any more.
+
+#### The org PAT has no `write:packages`
+
+Since 25.11.2026 `EWWS_GITHUB_TOKEN` (`mekoAutomation`) cannot push to
+ghcr.io. A `docker login ghcr.io` with it followed by a push fails; push
+through this workflow with `GITHUB_TOKEN` instead. In this repository the
+PAT appears only as the optional `gh-pat` input of `build-and-push.yml` for
+private Go modules (BuildKit secret `gh_pat`): `release-please.yml` uses
+`GITHUB_TOKEN`, and `write-registry-tag.yml` uses the `ewws-registry-tagger`
+App. Callers still use the PAT for their own release-please workflows and
+checkouts of other private repositories.
+
 ### `write-registry-tag.yml`
 
 Records which image an app runs on a stage: it writes
