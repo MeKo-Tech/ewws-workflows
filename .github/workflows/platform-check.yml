@@ -164,7 +164,9 @@ jobs:
             if [[ -n "$plain" ]]; then
               err "$path" "${path}: unencrypted values at ${plain} — encrypt the whole file with sops"
             fi
-          done < <(git ls-files -z -- '*.sops.yaml')
+          # The sops config .sops.yaml (written by platform-secrets.sh init) also
+          # matches *.sops.yaml but holds creation rules, not secrets: skip it.
+          done < <(git ls-files -z -- '*.sops.yaml' ':(exclude,glob)**/.sops.yaml' ':(exclude).sops.yaml')
 
           sealed_files=0
           while IFS= read -r -d '' path; do
