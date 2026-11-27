@@ -42,9 +42,9 @@ on:
         type: string
         required: true
       image-ownership-mode:
-        description: "What happens when `image-name` is not `ghcr.io/meko-tech/<repo>` or below it: `warn` (annotation, the build goes on) or `error` (the job fails)."
+        description: "What happens when `image-name` is not `ghcr.io/meko-tech/<repo>` or below it: `error` (default, the job fails) or `warn` (annotation, the build goes on). `warn` is only a temporary way out for a repository that is moving its images; a caller sets it explicitly."
         type: string
-        default: warn
+        default: error
       dockerfile:
         description: "Path to the Dockerfile relative to repo root."
         type: string
