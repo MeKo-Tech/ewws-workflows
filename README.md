@@ -103,8 +103,11 @@ digest. Anything else (`,`, `=`, `:tag`, `@sha256:…`, whitespace) fails the
 job in either `image-ownership-mode`; a comma would otherwise let
 metadata-action split the value into a second, foreign image. It then checks
 the name against the caller repository (`github.repository`). `image-ownership-mode` decides what
-a name outside `ghcr.io/meko-tech/<repo>` does: `warn` (default) writes an
-`image ownership` warning and builds anyway, `error` fails the job.
+a name outside `ghcr.io/meko-tech/<repo>` does: `error` (default) fails the
+job, `warn` writes an `image ownership` warning and builds anyway. `warn` is
+only a temporary way out for a repository that is still moving its images,
+and the caller has to set it explicitly; a caller that follows the naming rule
+needs neither value.
 
 Tags are the metadata-action rules `type=ref,event=branch`,
 `type=ref,event=pr`, `type=semver` (`{{version}}`, `{{major}}.{{minor}}`,
